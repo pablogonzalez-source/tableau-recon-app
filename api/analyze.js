@@ -19,7 +19,7 @@ Status rules:
 
 deltaClass per row: "good" if |Δ| ≤ 5%, "meh" if 5-20%, "bad" if > 20%.
 
-Return ONLY a JSON object, no markdown fences, no explanation:
+CRITICAL: Respond with ONLY a single JSON object. No prose before, no prose after, no markdown code fences. Start your response with { and end with }.
 
 {
   "account": "name",
@@ -33,6 +33,24 @@ Return ONLY a JSON object, no markdown fences, no explanation:
     {"section":"...", "metric":"Spend", "platform":"$X", "tableau":"$Y", "delta":"+/-Z%", "deltaClass":"good|meh|bad", "note": "optional"}
   ]
 }`;
+
+function extractJson(text) {
+  if (!text) return null;
+  // Strip markdown code fences (json or plain) wherever they appear
+  let s = String(text)
+    .replace(/```json\s*\n?/gi, '')
+    .replace(/```\s*\n?/g, '')
+    .trim();
+  // Try direct parse
+  try { return JSON.parse(s); } catch (_) {}
+  // Find first { and last } — Claude sometimes adds preamble/postamble
+  const start = s.indexOf('{');
+  const end = s.lastIndexOf('}');
+  if (start !== -1 && end > start) {
+    try { return JSON.parse(s.slice(start, end + 1)); } catch (_) {}
+  }
+  return null;
+}
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
@@ -73,10 +91,10 @@ export default async function handler(req, res) {
         'anthropic-version': '2023-06-01',
       },
       body: JSON.stringify({
-        // Sonnet has a strong vision/cost balance. If you want top quality,
-        // switch to 'claude-opus-4-7'. For lowest cost, 'claude-haiku-4-5-20251001'.
+        // Sonnet has a strong vision/cost balance. For top quality use
+        // 'claude-opus-4-7'; for lowest cost 'claude-haiku-4-5-20251001'.
         model: 'claude-sonnet-4-6',
-        max_tokens: 2000,
+        max_tokens: 3000,
         messages: [{ role: 'user', content }],
       }),
     });
@@ -92,15 +110,12 @@ export default async function handler(req, res) {
       .map((c) => c.text)
       .join('\n');
 
-    const clean = text.replace(/```json\n?|```/g, '').trim();
-
-    let parsed;
-    try {
-      parsed = JSON.parse(clean);
-    } catch (_e) {
+    const parsed = extractJson(text);
+    if (!parsed) {
       return res.status(200).json({
         _parseError: true,
-        rawResponse: clean.slice(0, 1500),
+        rawResponse: text.slice(0, 3000),
+        stopReason: data.stop_reason || null,
       });
     }
     return res.status(200).json(parsed);
