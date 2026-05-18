@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo } from 'react';
-import { Plus, Pencil, Trash2, X, Image as ImageIcon, Save, Upload, Eye, Database, Sparkles, Loader2, AlertCircle } from 'lucide-react';
+import { Plus, Pencil, Trash2, X, Image as ImageIcon, Save, Upload, Eye, Database, Sparkles, Loader2, AlertCircle, ScanText, RefreshCw } from 'lucide-react';
 import { api } from './api.js';
 
 // ─── DESIGN TOKENS ───
@@ -11,6 +11,7 @@ const T = {
   warning: '#d9b366', warningSoft: 'rgba(217,179,102,0.08)',
   danger: '#d97b78', dangerSoft: 'rgba(217,123,120,0.08)',
   accent: '#a78bfa', accentSoft: 'rgba(167,139,250,0.10)',
+  teal: '#5eead4', tealSoft: 'rgba(94,234,212,0.10)',
   fontDisplay: "'Fraunces', Georgia, serif",
   fontBody: "'Geist', -apple-system, sans-serif",
   fontMono: "'JetBrains Mono', ui-monospace, monospace",
@@ -22,6 +23,7 @@ const STATUS = {
   warn:  { color: T.warning, soft: T.warningSoft },
   issue: { color: T.danger,  soft: T.dangerSoft },
 };
+const EMPTY_VOCAB = { account: [], surface: [], platform_label: [], status_label: [], section: [], metric: [] };
 
 // ─── HELPERS ───
 const uid = () => 'id_' + Math.random().toString(36).slice(2, 10);
@@ -32,6 +34,103 @@ const blank = {
 };
 const fileToDataUri = (f) => new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = rej; r.readAsDataURL(f); });
 
+// ─── OCR LOGIC ───
+const BUILT_IN_KEYWORDS = {
+  Spend:       ['spend', 'inversión', 'inversion', 'investimento', 'costo total', 'costo', 'cost'],
+  Sales:       ['ad sales', 'sales', 'ventas', 'vendas'],
+  Revenue:     ['revenue', 'ingresos', 'receita'],
+  Impressions: ['impressions', 'impresiones', 'impressões', 'impressoes'],
+  Clicks:      ['clicks', 'clics', 'cliques'],
+  CPC:         ['avg cpc', 'cpc'],
+  CPM:         ['avg cpm', 'cpm'],
+  CTR:         ['ctr'],
+  ROAS:        ['roas'],
+  ACOS:        ['acos'],
+  Purchases:   ['purchases', 'compras'],
+  Units:       ['units', 'unidades'],
+  DPV:         ['dpv', 'vistas de página', 'page views'],
+};
+
+const NUMBER_RE = /[-−+]?(?:[$€¥]\s*|USD\s*|US\$\s*|MX\$\s*|R\$\s*)?\d{1,3}(?:[.,\s]\d{3})*(?:[.,]\d+)?\s*(?:[KMB]|%|\$MX|MXN|USD)?/gi;
+
+// Build extended keyword map: built-in + user-defined metrics from vocabulary
+function buildKeywordMap(vocabMetrics = []) {
+  const map = { ...BUILT_IN_KEYWORDS };
+  for (const m of vocabMetrics) {
+    if (!m) continue;
+    if (!map[m]) map[m] = [m.toLowerCase()];
+  }
+  return map;
+}
+
+function extractMetricsFromText(text, keywordMap) {
+  const lower = text.toLowerCase();
+  const found = {};
+  for (const [metric, keywords] of Object.entries(keywordMap)) {
+    for (const kw of keywords) {
+      const idx = lower.indexOf(kw);
+      if (idx >= 0) {
+        const snippet = text.slice(Math.max(0, idx - 25), Math.min(text.length, idx + 90));
+        const matches = (snippet.match(NUMBER_RE) || []).map(s => s.trim()).filter(s => /\d/.test(s) && s.length >= 2);
+        if (matches.length) {
+          found[metric] = matches.slice(0, 3);
+          break;
+        }
+      }
+    }
+  }
+  return found;
+}
+
+// Auto-detection: find vocabulary terms inside the OCR text
+function detectFromText(text, vocabulary) {
+  const lower = (text || '').toLowerCase();
+  const detected = {};
+  for (const cat of ['account', 'surface', 'platform_label', 'section']) {
+    const terms = vocabulary[cat] || [];
+    for (const term of terms) {
+      if (!term) continue;
+      if (lower.includes(term.toLowerCase())) {
+        detected[cat] = term; // most-used wins because list is sorted
+        break;
+      }
+    }
+  }
+  return detected;
+}
+
+function parseNumber(str) {
+  if (!str) return null;
+  let s = String(str).trim();
+  let isNeg = false;
+  if (s.startsWith('-') || s.startsWith('−')) { isNeg = true; s = s.slice(1); }
+  s = s.replace(/[$€¥\s]/g, '').replace(/(?:MX\$|US\$|MXN|USD|R\$|MX)/gi, '');
+  let mult = 1;
+  const last = s.charAt(s.length - 1);
+  if (/k/i.test(last)) { mult = 1e3; s = s.slice(0, -1); }
+  else if (/m/i.test(last)) { mult = 1e6; s = s.slice(0, -1); }
+  else if (/b/i.test(last)) { mult = 1e9; s = s.slice(0, -1); }
+  else if (last === '%') { s = s.slice(0, -1); }
+  const lc = s.lastIndexOf(','), ld = s.lastIndexOf('.');
+  if (lc > ld) { s = s.replace(/\./g, '').replace(',', '.'); }
+  else { s = s.replace(/,/g, ''); }
+  const n = parseFloat(s);
+  if (isNaN(n)) return null;
+  return (isNeg ? -1 : 1) * n * mult;
+}
+
+function computeDelta(platformStr, tableauStr) {
+  const p = parseNumber(platformStr);
+  const t = parseNumber(tableauStr);
+  if (p === null || t === null || p === 0) return { delta: '', deltaClass: 'good' };
+  const pct = ((t - p) / p) * 100;
+  const sign = pct > 0 ? '+' : '';
+  const deltaStr = `${sign}${pct.toFixed(1)}%`;
+  const abs = Math.abs(pct);
+  const cls = abs <= 5 ? 'good' : abs <= 20 ? 'meh' : 'bad';
+  return { delta: deltaStr, deltaClass: cls };
+}
+
 // ─── UI PRIMITIVES ───
 function Btn({ children, onClick, variant = 'default', icon: Icon, size = 'md', style = {}, disabled, ...rest }) {
   const sizes = { sm: { padding: '6px 11px', fontSize: 10.5, gap: 6 }, md: { padding: '9px 16px', fontSize: 11, gap: 8 } };
@@ -39,6 +138,7 @@ function Btn({ children, onClick, variant = 'default', icon: Icon, size = 'md', 
     default: { background: 'transparent', border: `1px solid ${T.borderLight}`, color: T.textSec },
     primary: { background: T.success, border: `1px solid ${T.success}`, color: '#0a0e1a' },
     accent:  { background: T.accent, border: `1px solid ${T.accent}`, color: '#0a0e1a' },
+    teal:    { background: T.teal, border: `1px solid ${T.teal}`, color: '#0a0e1a' },
     danger:  { background: 'transparent', border: `1px solid ${T.danger}`, color: T.danger },
     ghost:   { background: 'transparent', border: '1px solid transparent', color: T.textSec },
   };
@@ -72,6 +172,57 @@ function Input({ value, onChange, placeholder, multiline, mono, style = {} }) {
   return multiline ? <textarea {...props} /> : <input {...props} />;
 }
 
+// Autocomplete input: like Input, but shows a dropdown of suggestions
+// from the `suggestions` array. Filters by substring as you type.
+function AutocompleteInput({ value, onChange, placeholder, suggestions = [], mono, style = {} }) {
+  const [focused, setFocused] = useState(false);
+  const [showList, setShowList] = useState(false);
+
+  const filtered = useMemo(() => {
+    const q = (value || '').toLowerCase().trim();
+    if (!q) return suggestions.slice(0, 6);
+    return suggestions.filter(s => s && s.toLowerCase().includes(q) && s.toLowerCase() !== q).slice(0, 6);
+  }, [value, suggestions]);
+
+  return (
+    <div style={{ position: 'relative' }}>
+      <input
+        value={value || ''}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder={placeholder}
+        onFocus={() => { setFocused(true); setShowList(true); }}
+        onBlur={() => { setFocused(false); setTimeout(() => setShowList(false), 160); }}
+        style={{
+          width: '100%', background: T.bgInput, border: `1px solid ${focused ? T.textSec : T.border}`,
+          color: T.text, padding: '10px 12px', fontSize: 13,
+          fontFamily: mono ? T.fontMono : T.fontBody,
+          borderRadius: 2, outline: 'none', boxSizing: 'border-box', ...style,
+        }}
+      />
+      {showList && filtered.length > 0 && (
+        <div style={{
+          position: 'absolute', top: 'calc(100% + 2px)', left: 0, right: 0,
+          background: T.bgInput, border: `1px solid ${T.borderLight}`,
+          borderRadius: 2, zIndex: 50, maxHeight: 220, overflowY: 'auto',
+          boxShadow: '0 8px 24px rgba(0,0,0,0.55)',
+        }}>
+          {filtered.map((s, i) => (
+            <div
+              key={i}
+              onMouseDown={(e) => { e.preventDefault(); onChange(s); setShowList(false); }}
+              onMouseEnter={(e) => { e.currentTarget.style.background = T.bgCard; }}
+              onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}
+              style={{ padding: '8px 12px', cursor: 'pointer', fontSize: 12.5, color: T.text, fontFamily: mono ? T.fontMono : T.fontBody, borderBottom: i < filtered.length - 1 ? `1px solid ${T.border}` : 'none' }}
+            >
+              {s}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function Select({ value, onChange, options, style = {} }) {
   return <select value={value} onChange={(e) => onChange(e.target.value)} style={{
     background: T.bgInput, border: `1px solid ${T.border}`, color: T.text, padding: '10px 12px',
@@ -101,15 +252,11 @@ function Modal({ title, onClose, maxWidth = 900, children }) {
   );
 }
 
-function Header({ meta, onAdd, editMode, setEditMode, onEditMeta, saving }) {
+function Header({ meta, onAdd, editMode, setEditMode, onEditMeta }) {
   const words = (meta.title || 'Tableau Reconciliation').split(' ');
   return (
     <header style={{ marginBottom: 56, paddingBottom: 32, borderBottom: `1px solid ${T.border}` }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 20 }}>
-        <div style={{ fontFamily: T.fontMono, fontSize: 11, color: T.textTer, letterSpacing: '0.22em', textTransform: 'uppercase' }}>Reconciliation App · multi-user</div>
-        {saving && <div style={{ fontFamily: T.fontMono, fontSize: 10, color: T.warning, letterSpacing: '0.14em', textTransform: 'uppercase', display: 'inline-flex', alignItems: 'center', gap: 6 }}><Loader2 size={11} strokeWidth={1.5} style={{ animation: 'spin 1s linear infinite' }} /> Saving…</div>}
-        <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
-      </div>
+      <div style={{ fontFamily: T.fontMono, fontSize: 11, color: T.textTer, letterSpacing: '0.22em', textTransform: 'uppercase', marginBottom: 20 }}>Reconciliation App · multi-user</div>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 24, flexWrap: 'wrap', marginBottom: 18 }}>
         <h1 style={{ fontFamily: T.fontDisplay, fontWeight: 400, fontSize: 'clamp(36px, 5vw, 56px)', lineHeight: 0.98, letterSpacing: '-0.035em', margin: 0 }}>
           {words.slice(0, -1).join(' ')} <em style={{ fontStyle: 'italic', fontWeight: 300, color: T.textSec }}>{words[words.length - 1]}</em>
@@ -204,7 +351,7 @@ function EvidenceModal({ audit, onClose }) {
       {(!audit.evidence || audit.evidence.length === 0) && <div style={{ color: T.textTer, fontStyle: 'italic' }}>No evidence attached.</div>}
       {(audit.evidence || []).map((ev, i, arr) => (
         <div key={ev.id} style={{ marginBottom: 36, paddingBottom: 36, borderBottom: i < arr.length - 1 ? `1px solid ${T.border}` : 'none' }}>
-          <div style={{ fontFamily: T.fontMono, fontSize: 11, color: T.textTer, textTransform: 'uppercase', letterSpacing: '0.14em', marginBottom: 10 }}>{ev.label}</div>
+          <div style={{ fontFamily: T.fontMono, fontSize: 11, color: T.textTer, textTransform: 'uppercase', letterSpacing: '0.14em', marginBottom: 10 }}>{ev.label}{ev.type ? ` · ${ev.type}` : ''}</div>
           <div style={{ color: T.textSec, fontSize: 13.5, lineHeight: 1.6, marginBottom: 16, maxWidth: '75ch' }}>{ev.caption}</div>
           <img src={ev.src} alt={ev.label} style={{ maxWidth: '100%', height: 'auto', border: `1px solid ${T.border}`, borderRadius: 2, display: 'block' }} />
         </div>
@@ -213,12 +360,20 @@ function EvidenceModal({ audit, onClose }) {
   );
 }
 
-function AuditEditor({ audit, defaultPeriod, onSave, onClose }) {
+function AuditEditor({ audit, defaultPeriod, vocabulary, onSave, onClose }) {
   const [d, setD] = useState(audit || blank.audit(defaultPeriod));
+  // Claude AI state
   const [analyzing, setAnalyzing] = useState(false);
   const [aiError, setAiError] = useState(null);
   const [aiStatus, setAiStatus] = useState(null);
   const [aiRaw, setAiRaw] = useState(null);
+  // OCR state
+  const [ocring, setOcring] = useState(false);
+  const [ocrError, setOcrError] = useState(null);
+  const [ocrStatus, setOcrStatus] = useState(null);
+  // Detection feedback
+  const [detectedNote, setDetectedNote] = useState(null);
+  // Save state
   const [saving, setSaving] = useState(false);
 
   const upd = (k, v) => setD((p) => ({ ...p, [k]: v }));
@@ -233,14 +388,118 @@ function AuditEditor({ audit, defaultPeriod, onSave, onClose }) {
     const newEv = [];
     for (const f of list) {
       const src = await fileToDataUri(f);
-      newEv.push({ id: uid(), src, label: f.name.replace(/\.[^/.]+$/, ''), caption: '' });
+      newEv.push({ id: uid(), src, label: f.name.replace(/\.[^/.]+$/, ''), caption: '', type: '' });
     }
     setD((p) => ({ ...p, evidence: [...p.evidence, ...newEv] }));
   };
 
+  // ─── OCR EXTRACTION (in-browser) ───
+  const runOcr = async () => {
+    if (d.evidence.length === 0) { setOcrError('Add screenshots first.'); return; }
+    const tagged = { tableau: d.evidence.filter(e => e.type === 'tableau'), platform: d.evidence.filter(e => e.type === 'platform') };
+    if (tagged.tableau.length === 0 || tagged.platform.length === 0) {
+      setOcrError('Tag at least one screenshot as Tableau and one as Platform (dropdown next to each image).');
+      return;
+    }
+    if (!window.Tesseract) { setOcrError('Tesseract.js failed to load. Check internet/refresh.'); return; }
+
+    setOcring(true); setOcrError(null); setAiError(null); setDetectedNote(null);
+    const keywordMap = buildKeywordMap(vocabulary.metric);
+    try {
+      // Per-image: OCR → extract metrics → detect terms (account/surface/section)
+      const perImage = [];
+      let i = 0;
+      for (const ev of d.evidence) {
+        i++;
+        if (ev.type !== 'tableau' && ev.type !== 'platform') continue;
+        setOcrStatus(`OCR ${i}/${d.evidence.length} · ${ev.label || 'unnamed'}…`);
+        // eslint-disable-next-line no-await-in-loop
+        const result = await window.Tesseract.recognize(ev.src, 'eng+spa+por');
+        const text = result.data.text;
+        perImage.push({
+          ev,
+          text,
+          metrics: extractMetricsFromText(text, keywordMap),
+          detected: detectFromText(text, vocabulary),
+        });
+      }
+
+      // Aggregate metrics per type, keeping track of source image's section
+      const byType = { tableau: {}, platform: {} };
+      for (const item of perImage) {
+        const target = byType[item.ev.type];
+        if (!target) continue;
+        const sectionForThisImage = item.detected.section || '';
+        for (const [m, vals] of Object.entries(item.metrics)) {
+          if (!target[m]) target[m] = { value: vals[0], section: sectionForThisImage };
+        }
+      }
+
+      const allMetrics = new Set([...Object.keys(byType.tableau), ...Object.keys(byType.platform)]);
+      const newRows = [];
+      for (const m of allMetrics) {
+        const platformData = byType.platform[m] || {};
+        const tableauData = byType.tableau[m] || {};
+        const platformVal = platformData.value || '';
+        const tableauVal = tableauData.value || '';
+        const section = platformData.section || tableauData.section || '';
+        const { delta, deltaClass } = computeDelta(platformVal, tableauVal);
+        newRows.push({ id: uid(), section, metric: m, platform: platformVal, tableau: tableauVal, delta, deltaClass, note: '' });
+      }
+
+      // Auto-status based on worst delta
+      let autoStatus = 'clean';
+      for (const r of newRows) {
+        if (r.deltaClass === 'bad') { autoStatus = 'issue'; break; }
+        if (r.deltaClass === 'meh') autoStatus = 'warn';
+      }
+
+      // Top-level detection: combine all OCR text and look up vocabulary
+      const allText = perImage.map(p => p.text).join('\n');
+      const topDetect = detectFromText(allText, vocabulary);
+
+      // Apply: only fill empty fields (don't clobber user's work)
+      setD(prev => ({
+        ...prev,
+        account: prev.account || topDetect.account || '',
+        surface: prev.surface || topDetect.surface || '',
+        platformLabel: (!prev.platformLabel || prev.platformLabel === 'Platform') ? (topDetect.platform_label || prev.platformLabel) : prev.platformLabel,
+        rows: [...prev.rows, ...newRows],
+        status: prev.rows.length === 0 ? autoStatus : prev.status,
+      }));
+
+      const detectedHits = [];
+      if (topDetect.account)        detectedHits.push(`Account: ${topDetect.account}`);
+      if (topDetect.surface)        detectedHits.push(`Surface: ${topDetect.surface}`);
+      if (topDetect.platform_label) detectedHits.push(`Platform: ${topDetect.platform_label}`);
+      const sectionsDetected = perImage.map(p => p.detected.section).filter(Boolean);
+      if (sectionsDetected.length) detectedHits.push(`Sections: ${[...new Set(sectionsDetected)].join(', ')}`);
+
+      setOcrStatus(`✓ ${newRows.length} rows extracted. Review numbers — OCR can misread $ as S, 0 as O, etc.`);
+      if (detectedHits.length) setDetectedNote(detectedHits.join(' · '));
+      setTimeout(() => setOcrStatus(null), 10000);
+    } catch (e) {
+      setOcrError(`OCR failed: ${e.message || e}`);
+      setOcrStatus(null);
+    } finally {
+      setOcring(false);
+    }
+  };
+
+  const recomputeDeltas = () => {
+    setD(prev => ({
+      ...prev,
+      rows: prev.rows.map(r => {
+        if (!r.platform || !r.tableau) return r;
+        const { delta, deltaClass } = computeDelta(r.platform, r.tableau);
+        return { ...r, delta: delta || r.delta, deltaClass: delta ? deltaClass : r.deltaClass };
+      }),
+    }));
+  };
+
   const runAnalysis = async () => {
     if (d.evidence.length === 0) { setAiError('Add at least one screenshot first.'); return; }
-    setAnalyzing(true); setAiError(null); setAiStatus('Sending images to Claude…'); setAiRaw(null);
+    setAnalyzing(true); setAiError(null); setAiStatus('Sending images to Claude…'); setAiRaw(null); setOcrError(null);
     try {
       const images = d.evidence.map((ev) => ev.src);
       const parsed = await api.analyze(images);
@@ -248,7 +507,6 @@ function AuditEditor({ audit, defaultPeriod, onSave, onClose }) {
         setAiError(`Claude responded but the output was not valid JSON${parsed.stopReason ? ' (stop_reason: ' + parsed.stopReason + ')' : ''}.`);
         setAiRaw(parsed.rawResponse || '');
         setAiStatus(null);
-        console.warn('Raw response from Claude:', parsed.rawResponse);
         return;
       }
       setD((prev) => ({
@@ -278,7 +536,7 @@ function AuditEditor({ audit, defaultPeriod, onSave, onClose }) {
     setSaving(true);
     try {
       const saved = await api.audits.save(d);
-      onSave(saved);
+      onSave(saved); // parent handles vocabulary update
     } catch (e) {
       alert(`Save failed: ${e.message}`);
       setSaving(false);
@@ -287,58 +545,93 @@ function AuditEditor({ audit, defaultPeriod, onSave, onClose }) {
 
   return (
     <Modal title={audit ? 'Edit audit' : 'New audit'} onClose={onClose} maxWidth={980}>
-      <div style={{ background: T.accentSoft, border: `1px solid ${T.accent}`, borderRadius: 2, padding: 18, marginBottom: 24 }}>
+      {/* ── OCR section ── */}
+      <div style={{ background: T.tealSoft, border: `1px solid ${T.teal}`, borderRadius: 2, padding: 18, marginBottom: 16 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
-          <Sparkles size={16} color={T.accent} strokeWidth={1.5} />
-          <div style={{ fontFamily: T.fontMono, fontSize: 11, color: T.accent, textTransform: 'uppercase', letterSpacing: '0.14em' }}>AI screenshot analysis</div>
+          <ScanText size={16} color={T.teal} strokeWidth={1.5} />
+          <div style={{ fontFamily: T.fontMono, fontSize: 11, color: T.teal, textTransform: 'uppercase', letterSpacing: '0.14em' }}>OCR extraction · offline · learning</div>
         </div>
         <p style={{ color: T.textSec, fontSize: 13, lineHeight: 1.55, marginBottom: 14, marginTop: 0 }}>
-          Drop your Tableau and platform screenshots in the Evidence section below, then click Analyze. Claude identifies each image, extracts the metrics, computes deltas, and fills the form for you to review.
+          1. Drop screenshots in Evidence below · 2. Tag each one as <strong style={{ color: T.text }}>Tableau</strong> or <strong style={{ color: T.text }}>Platform</strong> · 3. Click Extract. Numbers + known accounts, surfaces and sections from past audits get auto-filled.
         </p>
         <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
-          <Btn icon={analyzing ? Loader2 : Sparkles} onClick={runAnalysis} variant="accent" disabled={analyzing || d.evidence.length === 0}>
-            {analyzing ? 'Analyzing…' : `Analyze ${d.evidence.length || 'screenshots'}`}
+          <Btn icon={ocring ? Loader2 : ScanText} onClick={runOcr} variant="teal" disabled={ocring || d.evidence.length === 0}>
+            {ocring ? 'Extracting…' : 'Extract with OCR'}
           </Btn>
-          {aiStatus && <span style={{ color: T.success, fontSize: 12, fontFamily: T.fontMono }}>{aiStatus}</span>}
-          {aiError && <span style={{ color: T.danger, fontSize: 12, fontFamily: T.fontMono, display: 'inline-flex', alignItems: 'center', gap: 6 }}><AlertCircle size={12} />{aiError}</span>}
+          {ocrStatus && <span style={{ color: T.teal, fontSize: 12, fontFamily: T.fontMono }}>{ocrStatus}</span>}
+          {ocrError && <span style={{ color: T.danger, fontSize: 12, fontFamily: T.fontMono, display: 'inline-flex', alignItems: 'center', gap: 6 }}><AlertCircle size={12} />{ocrError}</span>}
         </div>
-        {aiRaw && (
-          <details style={{ marginTop: 14 }}>
-            <summary style={{ color: T.textTer, fontSize: 11, fontFamily: T.fontMono, cursor: 'pointer', textTransform: 'uppercase', letterSpacing: '0.12em' }}>Show raw response from Claude ↓</summary>
-            <pre style={{ marginTop: 10, padding: 12, background: T.bgInput, border: `1px solid ${T.border}`, borderRadius: 2, color: T.textSec, fontSize: 11, fontFamily: T.fontMono, lineHeight: 1.5, maxHeight: 240, overflow: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{aiRaw}</pre>
-          </details>
+        {detectedNote && (
+          <div style={{ marginTop: 12, padding: 10, background: T.bgInput, border: `1px dashed ${T.teal}`, borderRadius: 2, color: T.teal, fontSize: 11.5, fontFamily: T.fontMono }}>
+            🧠 Detected from vocabulary → {detectedNote}
+          </div>
         )}
       </div>
 
+      {/* ── Claude AI section (collapsible) ── */}
+      <details style={{ marginBottom: 24 }}>
+        <summary style={{ color: T.textTer, fontSize: 11, fontFamily: T.fontMono, cursor: 'pointer', textTransform: 'uppercase', letterSpacing: '0.12em', padding: '8px 0' }}>
+          ↓ Alternative: AI analysis with Claude (more accurate, consumes tokens)
+        </summary>
+        <div style={{ background: T.accentSoft, border: `1px solid ${T.accent}`, borderRadius: 2, padding: 18, marginTop: 8 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
+            <Sparkles size={16} color={T.accent} strokeWidth={1.5} />
+            <div style={{ fontFamily: T.fontMono, fontSize: 11, color: T.accent, textTransform: 'uppercase', letterSpacing: '0.14em' }}>Claude vision analysis</div>
+          </div>
+          <p style={{ color: T.textSec, fontSize: 13, lineHeight: 1.55, marginBottom: 14, marginTop: 0 }}>
+            Sends screenshots to Claude for full audit auto-fill. ~$0.02-0.05 per run.
+          </p>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+            <Btn icon={analyzing ? Loader2 : Sparkles} onClick={runAnalysis} variant="accent" disabled={analyzing || d.evidence.length === 0}>
+              {analyzing ? 'Analyzing…' : `Analyze ${d.evidence.length || 'screenshots'}`}
+            </Btn>
+            {aiStatus && <span style={{ color: T.success, fontSize: 12, fontFamily: T.fontMono }}>{aiStatus}</span>}
+            {aiError && <span style={{ color: T.danger, fontSize: 12, fontFamily: T.fontMono, display: 'inline-flex', alignItems: 'center', gap: 6 }}><AlertCircle size={12} />{aiError}</span>}
+          </div>
+          {aiRaw && (
+            <details style={{ marginTop: 14 }}>
+              <summary style={{ color: T.textTer, fontSize: 11, fontFamily: T.fontMono, cursor: 'pointer', textTransform: 'uppercase', letterSpacing: '0.12em' }}>Show raw response from Claude ↓</summary>
+              <pre style={{ marginTop: 10, padding: 12, background: T.bgInput, border: `1px solid ${T.border}`, borderRadius: 2, color: T.textSec, fontSize: 11, fontFamily: T.fontMono, lineHeight: 1.5, maxHeight: 240, overflow: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{aiRaw}</pre>
+            </details>
+          )}
+        </div>
+      </details>
+
+      {/* ── Header fields with autocomplete ── */}
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 18, marginBottom: 18 }}>
-        <div><Label>Account</Label><Input value={d.account} onChange={(v) => upd('account', v)} placeholder="Bachoco" /></div>
-        <div><Label>Surface</Label><Input value={d.surface} onChange={(v) => upd('surface', v)} placeholder="Mercado Libre · Tableau" /></div>
+        <div><Label>Account</Label><AutocompleteInput value={d.account} onChange={(v) => upd('account', v)} placeholder="Bachoco" suggestions={vocabulary.account} /></div>
+        <div><Label>Surface</Label><AutocompleteInput value={d.surface} onChange={(v) => upd('surface', v)} placeholder="Mercado Libre · Tableau" suggestions={vocabulary.surface} /></div>
         <div><Label>Period</Label><Input value={d.period} onChange={(v) => upd('period', v)} placeholder="Apr 1 – Apr 30, 2026" /></div>
-        <div><Label>Platform label</Label><Input value={d.platformLabel} onChange={(v) => upd('platformLabel', v)} placeholder="MeLi platform" /></div>
+        <div><Label>Platform label</Label><AutocompleteInput value={d.platformLabel} onChange={(v) => upd('platformLabel', v)} placeholder="MeLi platform" suggestions={vocabulary.platform_label} /></div>
         <div><Label>Status</Label><Select value={d.status} onChange={(v) => upd('status', v)} options={[{ value: 'clean', label: 'Clean ✓' }, { value: 'warn', label: 'Watch ⚠' }, { value: 'issue', label: 'Issue ✗' }]} style={{ width: '100%' }} /></div>
-        <div><Label>Status label</Label><Input value={d.statusLabel} onChange={(v) => upd('statusLabel', v)} placeholder="BADS spend −54%" /></div>
+        <div><Label>Status label</Label><AutocompleteInput value={d.statusLabel} onChange={(v) => upd('statusLabel', v)} placeholder="BADS spend −54%" suggestions={vocabulary.status_label} /></div>
       </div>
       <div style={{ marginBottom: 26 }}><Label>Summary</Label><Input multiline value={d.summary} onChange={(v) => upd('summary', v)} placeholder="Narrative…" /></div>
 
+      {/* ── Metric rows with autocomplete on Section + Metric ── */}
       <div style={{ borderTop: `1px solid ${T.border}`, paddingTop: 24, marginBottom: 24 }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
           <div style={{ fontFamily: T.fontDisplay, fontSize: 18, fontWeight: 400 }}>Metric rows <span style={{ color: T.textTer, fontFamily: T.fontMono, fontSize: 11, marginLeft: 8 }}>({d.rows.length})</span></div>
-          <Btn icon={Plus} onClick={addRow} size="sm">Add row</Btn>
+          <div style={{ display: 'flex', gap: 6 }}>
+            <Btn icon={RefreshCw} onClick={recomputeDeltas} size="sm" disabled={d.rows.length === 0}>Recompute Δ</Btn>
+            <Btn icon={Plus} onClick={addRow} size="sm">Add row</Btn>
+          </div>
         </div>
-        {d.rows.length === 0 && <div style={{ color: T.textTer, fontStyle: 'italic', fontSize: 13, padding: '14px 0' }}>No metrics yet — analyze screenshots above, or add rows manually.</div>}
+        {d.rows.length === 0 && <div style={{ color: T.textTer, fontStyle: 'italic', fontSize: 13, padding: '14px 0' }}>No metrics yet — run OCR or AI above, or add rows manually.</div>}
         {d.rows.map((r) => (
-          <div key={r.id} style={{ display: 'grid', gridTemplateColumns: '1.2fr 1.2fr 1.2fr 1.2fr 0.8fr 1.2fr auto', gap: 8, marginBottom: 8, alignItems: 'center' }}>
-            <Input value={r.section} onChange={(v) => updRow(r.id, 'section', v)} placeholder="Section" mono />
-            <Input value={r.metric} onChange={(v) => updRow(r.id, 'metric', v)} placeholder="Metric" />
+          <div key={r.id} style={{ display: 'grid', gridTemplateColumns: '1.2fr 1.2fr 1.2fr 1.2fr 0.8fr 1.2fr auto', gap: 8, marginBottom: 8, alignItems: 'start' }}>
+            <AutocompleteInput value={r.section} onChange={(v) => updRow(r.id, 'section', v)} placeholder="Section" mono suggestions={vocabulary.section} />
+            <AutocompleteInput value={r.metric} onChange={(v) => updRow(r.id, 'metric', v)} placeholder="Metric" suggestions={vocabulary.metric} />
             <Input value={r.platform} onChange={(v) => updRow(r.id, 'platform', v)} placeholder="Platform" mono />
             <Input value={r.tableau} onChange={(v) => updRow(r.id, 'tableau', v)} placeholder="Tableau" mono />
             <Input value={r.delta} onChange={(v) => updRow(r.id, 'delta', v)} placeholder="Δ" mono />
             <Select value={r.deltaClass} onChange={(v) => updRow(r.id, 'deltaClass', v)} options={[{ value: 'good', label: '✓ good' }, { value: 'meh', label: '⚠ meh' }, { value: 'bad', label: '✗ bad' }]} />
-            <button onClick={() => delRow(r.id)} style={{ background: 'transparent', border: 'none', color: T.textTer, cursor: 'pointer', padding: 6 }}><Trash2 size={14} strokeWidth={1.5} /></button>
+            <button onClick={() => delRow(r.id)} style={{ background: 'transparent', border: 'none', color: T.textTer, cursor: 'pointer', padding: 6, marginTop: 8 }}><Trash2 size={14} strokeWidth={1.5} /></button>
           </div>
         ))}
       </div>
 
+      {/* ── Evidence ── */}
       <div style={{ borderTop: `1px solid ${T.border}`, paddingTop: 24, marginBottom: 24 }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
           <div style={{ fontFamily: T.fontDisplay, fontSize: 18, fontWeight: 400 }}>Evidence <span style={{ color: T.textTer, fontFamily: T.fontMono, fontSize: 11, marginLeft: 8 }}>({d.evidence.length})</span></div>
@@ -352,12 +645,13 @@ function AuditEditor({ audit, defaultPeriod, onSave, onClose }) {
           </label>
         </div>
         {d.evidence.map((ev) => (
-          <div key={ev.id} style={{ display: 'grid', gridTemplateColumns: '80px 1fr auto', gap: 14, marginBottom: 12, padding: 10, background: T.bgInput, border: `1px solid ${T.border}`, borderRadius: 2, alignItems: 'flex-start' }}>
+          <div key={ev.id} style={{ display: 'grid', gridTemplateColumns: '80px 110px 1fr auto', gap: 12, marginBottom: 12, padding: 10, background: T.bgInput, border: `1px solid ${T.border}`, borderRadius: 2, alignItems: 'flex-start' }}>
             <img src={ev.src} alt="" style={{ width: 80, height: 60, objectFit: 'cover', border: `1px solid ${T.border}`, borderRadius: 2 }} />
             <div>
-              <Input value={ev.label} onChange={(v) => updEv(ev.id, 'label', v)} placeholder="Label" mono style={{ marginBottom: 6, fontSize: 11.5 }} />
-              <Input multiline value={ev.caption} onChange={(v) => updEv(ev.id, 'caption', v)} placeholder="Caption…" style={{ minHeight: 50, fontSize: 12 }} />
+              <Select value={ev.type || ''} onChange={(v) => updEv(ev.id, 'type', v)} options={[{ value: '', label: '— Type —' }, { value: 'tableau', label: 'Tableau' }, { value: 'platform', label: 'Platform' }, { value: 'other', label: 'Other' }]} style={{ width: '100%', fontSize: 11, padding: '7px 8px' }} />
+              <Input value={ev.label} onChange={(v) => updEv(ev.id, 'label', v)} placeholder="Label" mono style={{ marginTop: 6, fontSize: 11 }} />
             </div>
+            <Input multiline value={ev.caption} onChange={(v) => updEv(ev.id, 'caption', v)} placeholder="Caption (optional)…" style={{ minHeight: 60, fontSize: 12 }} />
             <button onClick={() => delEv(ev.id)} style={{ background: 'transparent', border: 'none', color: T.textTer, cursor: 'pointer', padding: 6 }}><Trash2 size={14} strokeWidth={1.5} /></button>
           </div>
         ))}
@@ -448,10 +742,25 @@ function MetaEditor({ meta, onSave, onClose }) {
   );
 }
 
+// Extract terms from a saved audit for vocabulary learning
+function extractLearnings(audit) {
+  const out = [];
+  if (audit.account)       out.push({ category: 'account',        term: audit.account.trim() });
+  if (audit.surface)       out.push({ category: 'surface',        term: audit.surface.trim() });
+  if (audit.platformLabel && audit.platformLabel !== 'Platform') out.push({ category: 'platform_label', term: audit.platformLabel.trim() });
+  if (audit.statusLabel)   out.push({ category: 'status_label',   term: audit.statusLabel.trim() });
+  for (const r of (audit.rows || [])) {
+    if (r.section) out.push({ category: 'section', term: r.section.trim() });
+    if (r.metric)  out.push({ category: 'metric',  term: r.metric.trim() });
+  }
+  return out.filter(l => l.term);
+}
+
 export default function App() {
   const [meta, setMeta] = useState({ title: 'Tableau Reconciliation', subtitle: '', period: '' });
   const [audits, setAudits] = useState([]);
   const [investigations, setInvestigations] = useState([]);
+  const [vocabulary, setVocabulary] = useState(EMPTY_VOCAB);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState(null);
   const [editMode, setEditMode] = useState(false);
@@ -463,8 +772,13 @@ export default function App() {
   useEffect(() => {
     (async () => {
       try {
-        const [m, a, i] = await Promise.all([api.meta.get(), api.audits.list(), api.investigations.list()]);
-        setMeta(m); setAudits(a); setInvestigations(i);
+        const [m, a, i, v] = await Promise.all([
+          api.meta.get(),
+          api.audits.list(),
+          api.investigations.list(),
+          api.vocabulary.get().catch(() => EMPTY_VOCAB), // graceful if table doesn't exist yet
+        ]);
+        setMeta(m); setAudits(a); setInvestigations(i); setVocabulary({ ...EMPTY_VOCAB, ...v });
       } catch (e) {
         setLoadError(e.message);
       } finally {
@@ -480,9 +794,19 @@ export default function App() {
     issue: audits.filter((a) => a.status === 'issue').length,
   }), [audits]);
 
-  const handleSavedAudit = (saved) => {
+  const handleSavedAudit = async (saved) => {
     setAudits((p) => p.find((x) => x.id === saved.id) ? p.map((x) => (x.id === saved.id ? saved : x)) : [...p, saved]);
     setEditingAudit(null);
+    // Capture vocabulary from this audit (async, non-blocking)
+    const learnings = extractLearnings(saved);
+    if (learnings.length) {
+      try {
+        const updated = await api.vocabulary.save(learnings);
+        setVocabulary({ ...EMPTY_VOCAB, ...updated });
+      } catch (e) {
+        console.warn('Vocabulary update failed:', e.message);
+      }
+    }
   };
   const delAudit = async (a) => {
     if (!window.confirm(`Delete ${a.account} · ${a.surface}?`)) return;
@@ -522,7 +846,9 @@ export default function App() {
         <Summary stats={stats} />
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 24, flexWrap: 'wrap', marginBottom: 28 }}>
           <h2 style={{ fontFamily: T.fontDisplay, fontWeight: 400, fontSize: 28, letterSpacing: '-0.015em', margin: 0 }}>Account <em style={{ fontStyle: 'italic', color: T.textSec }}>audits</em></h2>
-          <span style={{ fontFamily: T.fontMono, fontSize: 11, color: T.textTer, textTransform: 'uppercase', letterSpacing: '0.15em' }}>{audits.length} audit{audits.length !== 1 ? 's' : ''}</span>
+          <span style={{ fontFamily: T.fontMono, fontSize: 11, color: T.textTer, textTransform: 'uppercase', letterSpacing: '0.15em' }}>
+            {audits.length} audit{audits.length !== 1 ? 's' : ''} · {Object.values(vocabulary).flat().length} terms learned
+          </span>
         </div>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 18, marginBottom: 72 }}>
           {audits.length === 0 && <div style={{ background: T.bgCard, border: `1px dashed ${T.borderLight}`, padding: 56, textAlign: 'center', color: T.textTer, fontSize: 13 }}>No audits yet. Click <strong style={{ color: T.text }}>Add audit</strong> to start.</div>}
@@ -530,10 +856,10 @@ export default function App() {
         </div>
         <Investigations list={investigations} editMode={editMode} onAdd={() => setEditingInv('new')} onEdit={(i) => setEditingInv(i.id)} onDelete={delInv} />
         <footer style={{ paddingTop: 32, borderTop: `1px solid ${T.border}`, color: T.textTer, fontSize: 11.5, fontFamily: T.fontMono, textAlign: 'center', letterSpacing: '0.08em' }}>
-          Reconciliation app · multi-user · AI-powered analysis
+          Reconciliation app · multi-user · OCR with learning vocabulary
         </footer>
       </div>
-      {editingAudit && <AuditEditor audit={editingAudit === 'new' ? null : audits.find((a) => a.id === editingAudit)} defaultPeriod={meta.period} onSave={handleSavedAudit} onClose={() => setEditingAudit(null)} />}
+      {editingAudit && <AuditEditor audit={editingAudit === 'new' ? null : audits.find((a) => a.id === editingAudit)} defaultPeriod={meta.period} vocabulary={vocabulary} onSave={handleSavedAudit} onClose={() => setEditingAudit(null)} />}
       {viewingEvidence && <EvidenceModal audit={viewingEvidence} onClose={() => setViewingEvidence(null)} />}
       {editingInv && <InvestigationEditor investigation={editingInv === 'new' ? null : investigations.find((i) => i.id === editingInv)} onSave={handleSavedInv} onClose={() => setEditingInv(null)} />}
       {editingMeta && <MetaEditor meta={meta} onSave={handleSavedMeta} onClose={() => setEditingMeta(false)} />}
