@@ -218,6 +218,7 @@ function AuditEditor({ audit, defaultPeriod, onSave, onClose }) {
   const [analyzing, setAnalyzing] = useState(false);
   const [aiError, setAiError] = useState(null);
   const [aiStatus, setAiStatus] = useState(null);
+  const [aiRaw, setAiRaw] = useState(null);
   const [saving, setSaving] = useState(false);
 
   const upd = (k, v) => setD((p) => ({ ...p, [k]: v }));
@@ -239,13 +240,15 @@ function AuditEditor({ audit, defaultPeriod, onSave, onClose }) {
 
   const runAnalysis = async () => {
     if (d.evidence.length === 0) { setAiError('Add at least one screenshot first.'); return; }
-    setAnalyzing(true); setAiError(null); setAiStatus('Sending images to Claude…');
+    setAnalyzing(true); setAiError(null); setAiStatus('Sending images to Claude…'); setAiRaw(null);
     try {
       const images = d.evidence.map((ev) => ev.src);
       const parsed = await api.analyze(images);
       if (parsed._parseError) {
-        setAiError('Claude responded but the output was not valid JSON. See console.');
-        console.warn('Raw response:', parsed.rawResponse);
+        setAiError(`Claude responded but the output was not valid JSON${parsed.stopReason ? ' (stop_reason: ' + parsed.stopReason + ')' : ''}.`);
+        setAiRaw(parsed.rawResponse || '');
+        setAiStatus(null);
+        console.warn('Raw response from Claude:', parsed.rawResponse);
         return;
       }
       setD((prev) => ({
@@ -263,8 +266,10 @@ function AuditEditor({ audit, defaultPeriod, onSave, onClose }) {
       setTimeout(() => setAiStatus(null), 6000);
     } catch (e) {
       setAiError(`Analysis failed: ${e.message}`);
+      setAiStatus(null);
+    } finally {
+      setAnalyzing(false);
     }
-    setAnalyzing(false);
   };
 
   const save = async () => {
@@ -297,6 +302,12 @@ function AuditEditor({ audit, defaultPeriod, onSave, onClose }) {
           {aiStatus && <span style={{ color: T.success, fontSize: 12, fontFamily: T.fontMono }}>{aiStatus}</span>}
           {aiError && <span style={{ color: T.danger, fontSize: 12, fontFamily: T.fontMono, display: 'inline-flex', alignItems: 'center', gap: 6 }}><AlertCircle size={12} />{aiError}</span>}
         </div>
+        {aiRaw && (
+          <details style={{ marginTop: 14 }}>
+            <summary style={{ color: T.textTer, fontSize: 11, fontFamily: T.fontMono, cursor: 'pointer', textTransform: 'uppercase', letterSpacing: '0.12em' }}>Show raw response from Claude ↓</summary>
+            <pre style={{ marginTop: 10, padding: 12, background: T.bgInput, border: `1px solid ${T.border}`, borderRadius: 2, color: T.textSec, fontSize: 11, fontFamily: T.fontMono, lineHeight: 1.5, maxHeight: 240, overflow: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{aiRaw}</pre>
+          </details>
+        )}
       </div>
 
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 18, marginBottom: 18 }}>
