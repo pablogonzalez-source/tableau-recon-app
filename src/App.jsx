@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo } from 'react';
-import { Plus, Pencil, Trash2, X, Image as ImageIcon, Save, Upload, Eye, Database, Sparkles, Loader2, AlertCircle, ScanText, RefreshCw } from 'lucide-react';
+import { Plus, Pencil, Trash2, X, Image as ImageIcon, Save, Upload, Eye, Database, Sparkles, Loader2, AlertCircle, ScanText, RefreshCw, GripVertical, Layers } from 'lucide-react';
 import { api } from './api.js';
 
 // ─── DESIGN TOKENS ───
@@ -131,7 +131,156 @@ function computeDelta(platformStr, tableauStr) {
   return { delta: deltaStr, deltaClass: cls };
 }
 
-// ─── UI PRIMITIVES ───
+// ─── PLATFORM + SERVICE DETECTION ───
+// Detects which ad platform a screenshot is from, by keywords in its OCR text.
+const PLATFORM_PATTERNS = [
+  { name: 'Amazon', kws: ['sponsored products', 'sponsored brands', 'sponsored ads', 'branded searches', 'detail page views', 'targeting performance', 'conversion path', 'ntb sales', 'create campaign', 'display, video', 'amazon'] },
+  { name: 'MeLi',   kws: ['campanhas', 'métricas atribuídas', 'metricas atribuidas', 'investimento', 'painel ao vivo', 'data de ação', 'mercado', 'meli', 'productos patrocinados', 'product ads'] },
+];
+function detectPlatformFromText(text) {
+  const lower = (text || '').toLowerCase();
+  let best = '', bestCount = 0;
+  for (const p of PLATFORM_PATTERNS) {
+    let c = 0;
+    for (const kw of p.kws) if (lower.includes(kw)) c++;
+    if (c > bestCount) { bestCount = c; best = p.name; }
+  }
+  return bestCount >= 1 ? best : '';
+}
+function detectPlatformFromName(name) {
+  const n = (name || '').toUpperCase();
+  if (/AMS|AMAZON/.test(n)) return 'Amazon';
+  if (/MELI|MLM|MERCADO/.test(n)) return 'MeLi';
+  return '';
+}
+// Detects the service/campaign-type from the file name (e.g. "3M-SP-AMS-NEXCARE" → Sponsored Products)
+function detectServiceFromName(name) {
+  const n = (name || '').toUpperCase();
+  if (/(^|[^A-Z])SP([^A-Z]|$)|SPONSORED.?PROD|PRODUCT.?AD/.test(n)) return 'Sponsored Products';
+  if (/(^|[^A-Z])SB([^A-Z]|$)|SPONSORED.?BRAND|BRAND.?AD/.test(n)) return 'Sponsored Brands';
+  if (/(^|[^A-Z])SD([^A-Z]|$)|DISPLAY|DVA|VIDEO/.test(n)) return 'Display / Video / Audio';
+  return '';
+}
+// Builds the aggregation group label for a screenshot, combining platform + service.
+function buildGroupLabel(platform, service) {
+  if (platform && service) return `${platform} · ${service}`;
+  return service || platform || '';
+}
+// Auto-suggest a group for a screenshot from its filename only (used at upload time, before OCR).
+function suggestGroupFromName(name) {
+  return buildGroupLabel(detectPlatformFromName(name), detectServiceFromName(name));
+}
+
+// ─── SMART AGGREGATION ───
+// Additive metrics can be summed across brands. Ratio metrics must be RECOMPUTED from the sums.
+const ADDITIVE_METRICS = ['Spend', 'Sales', 'Revenue', 'Impressions', 'Clicks', 'Purchases', 'Units', 'DPV'];
+const PCT_METRICS = ['ACOS', 'CTR'];
+const MONEY_RATIO_METRICS = ['CPC', 'CPM'];
+const DERIVED_METRICS = {
+  ROAS: (s) => (s.Spend > 0 ? (s.Sales || s.Revenue || 0) / s.Spend : null),
+  ACOS: (s) => ((s.Sales || s.Revenue) > 0 ? (s.Spend / (s.Sales || s.Revenue)) * 100 : null),
+  CPC:  (s) => (s.Clicks > 0 ? s.Spend / s.Clicks : null),
+  CPM:  (s) => (s.Impressions > 0 ? (s.Spend / s.Impressions) * 1000 : null),
+  CTR:  (s) => (s.Impressions > 0 ? (s.Clicks / s.Impressions) * 100 : null),
+};
+function formatNum(metric, n) {
+  if (n === null || n === undefined || !isFinite(n)) return '';
+  if (PCT_METRICS.includes(metric)) return n.toFixed(2) + '%';
+  if (MONEY_RATIO_METRICS.includes(metric) || metric === 'ROAS') return n.toFixed(2);
+  if (Number.isInteger(n)) return n.toLocaleString('en-US');
+  return n.toLocaleString('en-US', { maximumFractionDigits: 2 });
+}
+// Aggregate one side (platform or tableau) of a group.
+// If there's exactly one image and preferDirect is set, read its values verbatim.
+// Otherwise sum the additive metrics and recompute the ratios from those sums.
+function aggregateSide(images, { preferDirect }) {
+  if (preferDirect && images.length === 1) {
+    const out = {};
+    for (const [m, vals] of Object.entries(images[0].metrics)) out[m] = vals[0];
+    return out;
+  }
+  const sums = {};
+  for (const img of images) {
+    for (const [m, vals] of Object.entries(img.metrics)) {
+      if (ADDITIVE_METRICS.includes(m)) {
+        const v = parseNumber(vals[0]);
+        if (v !== null) sums[m] = (sums[m] || 0) + v;
+      }
+    }
+  }
+  const out = {};
+  for (const [m, v] of Object.entries(sums)) out[m] = formatNum(m, v);
+  for (const [m, fn] of Object.entries(DERIVED_METRICS)) {
+    const v = fn(sums);
+    if (v !== null && isFinite(v)) out[m] = formatNum(m, v);
+  }
+  return out;
+}
+
+// ─── CLAUDE-VISION AGGREGATION (Option B: Claude reads per brand, code sums) ───
+// Aggregate the platform side from Claude's per-brand breakdown.
+// One brand → read its metrics verbatim. Multiple brands → sum additives, recompute ratios.
+function aggregatePlatformBrands(brands) {
+  const list = Array.isArray(brands) ? brands : [];
+  if (list.length === 1) {
+    return { ...(list[0].metrics || {}) };
+  }
+  const sums = {};
+  for (const b of list) {
+    const m = b.metrics || {};
+    for (const [metric, valStr] of Object.entries(m)) {
+      if (ADDITIVE_METRICS.includes(metric)) {
+        const v = parseNumber(valStr);
+        if (v !== null) sums[metric] = (sums[metric] || 0) + v;
+      }
+    }
+  }
+  const out = {};
+  for (const [metric, v] of Object.entries(sums)) out[metric] = formatNum(metric, v);
+  for (const [metric, fn] of Object.entries(DERIVED_METRICS)) {
+    const v = fn(sums);
+    if (v !== null && isFinite(v)) out[metric] = formatNum(metric, v);
+  }
+  return out;
+}
+
+// Turn Claude's grouped output into flat metric rows. Platform side is summed
+// from the brand breakdown; tableau side is the aggregated figure Claude read.
+function buildRowsFromGroups(groups) {
+  const rows = [];
+  const metricOrder = [...ADDITIVE_METRICS, 'ROAS', 'ACOS', 'CPC', 'CPM', 'CTR'];
+  for (const g of (groups || [])) {
+    const brands = g.platformBrands || [];
+    const platformAgg = aggregatePlatformBrands(brands);
+    const tableauAgg = g.tableau || {};
+    const isCombined = brands.length > 1;
+    const base = g.service || '';
+    const section = isCombined ? `${base} — ALL BRANDS COMBINED` : base;
+    const metrics = new Set([...Object.keys(platformAgg), ...Object.keys(tableauAgg)]);
+    const ordered = metricOrder.filter((m) => metrics.has(m));
+    const rest = [...metrics].filter((m) => !ordered.includes(m));
+    for (const m of [...ordered, ...rest]) {
+      const pStr = platformAgg[m] != null ? String(platformAgg[m]) : '';
+      const tStr = tableauAgg[m] != null ? String(tableauAgg[m]) : '';
+      if (!pStr && !tStr) continue;
+      const { delta, deltaClass } = computeDelta(pStr, tStr);
+      const note = isCombined
+        ? `Σ of ${brands.length} brands${DERIVED_METRICS[m] ? ' (ratio recomputed)' : ''}`
+        : '';
+      rows.push({ id: uid(), section, metric: m, platform: pStr, tableau: tStr, delta, deltaClass, note });
+    }
+  }
+  return rows;
+}
+
+function worstStatus(rows) {
+  let s = 'clean';
+  for (const r of rows) {
+    if (r.deltaClass === 'bad') return 'issue';
+    if (r.deltaClass === 'meh') s = 'warn';
+  }
+  return s;
+}
 function Btn({ children, onClick, variant = 'default', icon: Icon, size = 'md', style = {}, disabled, ...rest }) {
   const sizes = { sm: { padding: '6px 11px', fontSize: 10.5, gap: 6 }, md: { padding: '9px 16px', fontSize: 11, gap: 8 } };
   const variants = {
@@ -383,12 +532,24 @@ function AuditEditor({ audit, defaultPeriod, vocabulary, onSave, onClose }) {
   const updEv = (id, k, v) => setD((p) => ({ ...p, evidence: p.evidence.map((e) => (e.id === id ? { ...e, [k]: v } : e)) }));
   const delEv = (id) => setD((p) => ({ ...p, evidence: p.evidence.filter((e) => e.id !== id) }));
 
+  // Drag-and-drop reordering of metric rows
+  const [dragIdx, setDragIdx] = useState(null);
+  const moveRow = (from, to) => {
+    setD((prev) => {
+      const rows = [...prev.rows];
+      const [moved] = rows.splice(from, 1);
+      rows.splice(to, 0, moved);
+      return { ...prev, rows };
+    });
+  };
+
   const handleFiles = async (files) => {
     const list = Array.from(files).filter((f) => f.type.startsWith('image/'));
     const newEv = [];
     for (const f of list) {
       const src = await fileToDataUri(f);
-      newEv.push({ id: uid(), src, label: f.name.replace(/\.[^/.]+$/, ''), caption: '', type: '' });
+      const label = f.name.replace(/\.[^/.]+$/, '');
+      newEv.push({ id: uid(), src, label, caption: '', type: '', group: suggestGroupFromName(label) });
     }
     setD((p) => ({ ...p, evidence: [...p.evidence, ...newEv] }));
   };
@@ -406,7 +567,7 @@ function AuditEditor({ audit, defaultPeriod, vocabulary, onSave, onClose }) {
     setOcring(true); setOcrError(null); setAiError(null); setDetectedNote(null);
     const keywordMap = buildKeywordMap(vocabulary.metric);
     try {
-      // Per-image: OCR → extract metrics → detect terms (account/surface/section)
+      // 1. OCR every tagged image; detect platform + service + metrics + vocab terms
       const perImage = [];
       let i = 0;
       for (const ev of d.evidence) {
@@ -416,68 +577,89 @@ function AuditEditor({ audit, defaultPeriod, vocabulary, onSave, onClose }) {
         // eslint-disable-next-line no-await-in-loop
         const result = await window.Tesseract.recognize(ev.src, 'eng+spa+por');
         const text = result.data.text;
+        const platform = detectPlatformFromName(ev.label) || detectPlatformFromText(text);
+        const service = detectServiceFromName(ev.label);
+        const autoGroup = buildGroupLabel(platform, service);
+        const group = (ev.group && ev.group.trim()) ? ev.group.trim() : autoGroup;
         perImage.push({
-          ev,
-          text,
+          ev, text, platform, service, group, autoGroup,
           metrics: extractMetricsFromText(text, keywordMap),
           detected: detectFromText(text, vocabulary),
         });
       }
 
-      // Aggregate metrics per type, keeping track of source image's section
-      const byType = { tableau: {}, platform: {} };
+      // 2. Group images by their effective group label (service). Within a group,
+      //    platform screenshots get summed; the tableau screenshot is the target.
+      const groups = {};
       for (const item of perImage) {
-        const target = byType[item.ev.type];
-        if (!target) continue;
-        const sectionForThisImage = item.detected.section || '';
-        for (const [m, vals] of Object.entries(item.metrics)) {
-          if (!target[m]) target[m] = { value: vals[0], section: sectionForThisImage };
+        const key = item.group || '__ungrouped__';
+        if (!groups[key]) groups[key] = { name: item.group || '', platform: [], tableau: [] };
+        if (item.ev.type === 'platform') groups[key].platform.push(item);
+        else if (item.ev.type === 'tableau') groups[key].tableau.push(item);
+      }
+
+      // 3. For each group: sum platform (recompute ratios), read tableau, build rows
+      const newRows = [];
+      const groupSummaries = [];
+      const metricOrder = [...ADDITIVE_METRICS, 'ROAS', 'ACOS', 'CPC', 'CPM', 'CTR'];
+      for (const key of Object.keys(groups)) {
+        const g = groups[key];
+        const platformAgg = aggregateSide(g.platform, { preferDirect: true });
+        const tableauAgg  = aggregateSide(g.tableau,  { preferDirect: true });
+        const metrics = new Set([...Object.keys(platformAgg), ...Object.keys(tableauAgg)]);
+        const ordered = metricOrder.filter(m => metrics.has(m));
+        const rest = [...metrics].filter(m => !ordered.includes(m));
+        for (const m of [...ordered, ...rest]) {
+          const pStr = platformAgg[m] || '';
+          const tStr = tableauAgg[m] || '';
+          if (!pStr && !tStr) continue;
+          const { delta, deltaClass } = computeDelta(pStr, tStr);
+          const brandCount = g.platform.length;
+          const note = brandCount > 1 ? `Σ of ${brandCount} platform screenshots (ratios recomputed)` : '';
+          newRows.push({ id: uid(), section: g.name, metric: m, platform: pStr, tableau: tStr, delta, deltaClass, note });
+        }
+        if (g.platform.length || g.tableau.length) {
+          groupSummaries.push(`${g.name || 'ungrouped'} (${g.platform.length}P/${g.tableau.length}T)`);
         }
       }
 
-      const allMetrics = new Set([...Object.keys(byType.tableau), ...Object.keys(byType.platform)]);
-      const newRows = [];
-      for (const m of allMetrics) {
-        const platformData = byType.platform[m] || {};
-        const tableauData = byType.tableau[m] || {};
-        const platformVal = platformData.value || '';
-        const tableauVal = tableauData.value || '';
-        const section = platformData.section || tableauData.section || '';
-        const { delta, deltaClass } = computeDelta(platformVal, tableauVal);
-        newRows.push({ id: uid(), section, metric: m, platform: platformVal, tableau: tableauVal, delta, deltaClass, note: '' });
-      }
-
-      // Auto-status based on worst delta
+      // 4. Auto-status from the worst delta
       let autoStatus = 'clean';
       for (const r of newRows) {
         if (r.deltaClass === 'bad') { autoStatus = 'issue'; break; }
         if (r.deltaClass === 'meh') autoStatus = 'warn';
       }
 
-      // Top-level detection: combine all OCR text and look up vocabulary
+      // 5. Global vocab detection + platforms found
       const allText = perImage.map(p => p.text).join('\n');
       const topDetect = detectFromText(allText, vocabulary);
+      const platformsDetected = [...new Set(perImage.map(p => p.platform).filter(Boolean))];
 
-      // Apply: only fill empty fields (don't clobber user's work)
+      // 6. Apply: backfill empty evidence groups, append rows, fill empty header fields
       setD(prev => ({
         ...prev,
         account: prev.account || topDetect.account || '',
         surface: prev.surface || topDetect.surface || '',
         platformLabel: (!prev.platformLabel || prev.platformLabel === 'Platform') ? (topDetect.platform_label || prev.platformLabel) : prev.platformLabel,
+        evidence: prev.evidence.map(e => {
+          const item = perImage.find(p => p.ev.id === e.id);
+          if (item && (!e.group || !e.group.trim()) && item.autoGroup) return { ...e, group: item.autoGroup };
+          return e;
+        }),
         rows: [...prev.rows, ...newRows],
         status: prev.rows.length === 0 ? autoStatus : prev.status,
       }));
 
-      const detectedHits = [];
-      if (topDetect.account)        detectedHits.push(`Account: ${topDetect.account}`);
-      if (topDetect.surface)        detectedHits.push(`Surface: ${topDetect.surface}`);
-      if (topDetect.platform_label) detectedHits.push(`Platform: ${topDetect.platform_label}`);
-      const sectionsDetected = perImage.map(p => p.detected.section).filter(Boolean);
-      if (sectionsDetected.length) detectedHits.push(`Sections: ${[...new Set(sectionsDetected)].join(', ')}`);
+      // 7. Feedback note
+      const hits = [];
+      if (platformsDetected.length) hits.push(`Platforms: ${platformsDetected.join(', ')}`);
+      if (groupSummaries.length)    hits.push(`Groups: ${groupSummaries.join(' · ')}`);
+      if (topDetect.account)        hits.push(`Account: ${topDetect.account}`);
+      if (topDetect.surface)        hits.push(`Surface: ${topDetect.surface}`);
 
-      setOcrStatus(`✓ ${newRows.length} rows extracted. Review numbers — OCR can misread $ as S, 0 as O, etc.`);
-      if (detectedHits.length) setDetectedNote(detectedHits.join(' · '));
-      setTimeout(() => setOcrStatus(null), 10000);
+      setOcrStatus(`✓ ${newRows.length} rows across ${Object.keys(groups).length} group(s). Review numbers — OCR can misread $ as S, 0 as O.`);
+      if (hits.length) setDetectedNote(hits.join('  ·  '));
+      setTimeout(() => setOcrStatus(null), 12000);
     } catch (e) {
       setOcrError(`OCR failed: ${e.message || e}`);
       setOcrStatus(null);
@@ -509,19 +691,34 @@ function AuditEditor({ audit, defaultPeriod, vocabulary, onSave, onClose }) {
         setAiStatus(null);
         return;
       }
+
+      // Option B: Claude returns per-brand groups → the code sums them.
+      // Fallback: if Claude returned the old flat "rows" shape, use it directly.
+      let rows, note;
+      if (Array.isArray(parsed.groups) && parsed.groups.length) {
+        rows = buildRowsFromGroups(parsed.groups);
+        const combinedCount = parsed.groups.filter((g) => (g.platformBrands || []).length > 1).length;
+        const totalBrands = parsed.groups.reduce((n, g) => n + (g.platformBrands || []).length, 0);
+        note = `✓ ${rows.length} rows · ${parsed.groups.length} service group(s) · ${totalBrands} brand screenshots${combinedCount ? `, ${combinedCount} summed` : ''}. Review before saving.`;
+      } else {
+        rows = (parsed.rows || []).map((r) => ({ ...r, id: uid() }));
+        note = `✓ Filled ${rows.length} rows. Review before saving.`;
+      }
+
+      const computedStatus = worstStatus(rows);
       setD((prev) => ({
         ...prev,
         account: parsed.account || prev.account,
         surface: parsed.surface || prev.surface,
         period: parsed.period || prev.period,
         platformLabel: parsed.platformLabel || prev.platformLabel,
-        status: parsed.status || prev.status,
+        status: parsed.status || computedStatus || prev.status,
         statusLabel: parsed.statusLabel || prev.statusLabel,
         summary: parsed.summary || prev.summary,
-        rows: (parsed.rows || []).map((r) => ({ ...r, id: uid() })),
+        rows,
       }));
-      setAiStatus(`✓ Filled ${parsed.rows?.length || 0} rows. Review before saving.`);
-      setTimeout(() => setAiStatus(null), 6000);
+      setAiStatus(note);
+      setTimeout(() => setAiStatus(null), 9000);
     } catch (e) {
       setAiError(`Analysis failed: ${e.message}`);
       setAiStatus(null);
@@ -552,7 +749,10 @@ function AuditEditor({ audit, defaultPeriod, vocabulary, onSave, onClose }) {
           <div style={{ fontFamily: T.fontMono, fontSize: 11, color: T.teal, textTransform: 'uppercase', letterSpacing: '0.14em' }}>OCR extraction · offline · learning</div>
         </div>
         <p style={{ color: T.textSec, fontSize: 13, lineHeight: 1.55, marginBottom: 14, marginTop: 0 }}>
-          1. Drop screenshots in Evidence below · 2. Tag each one as <strong style={{ color: T.text }}>Tableau</strong> or <strong style={{ color: T.text }}>Platform</strong> · 3. Click Extract. Numbers + known accounts, surfaces and sections from past audits get auto-filled.
+          1. Drop screenshots below · 2. Tag each as <strong style={{ color: T.text }}>Tableau</strong> or <strong style={{ color: T.text }}>Platform</strong>, and set its <strong style={{ color: T.text }}>Group</strong> (e.g. "Amazon · Sponsored Products") · 3. Click Extract. <strong style={{ color: T.text }}>Multiple platform screenshots in the same group get summed</strong> (ratios like ROAS/ACOS/CPC are recomputed from the totals) and compared to that group's Tableau. Platform, account & surface auto-detect when possible.
+        </p>
+        <p style={{ color: T.textTer, fontSize: 11.5, lineHeight: 1.5, marginBottom: 14, marginTop: 0, fontFamily: T.fontMono }}>
+          Tip: name files like <span style={{ color: T.teal }}>3M-SP-AMS-Nexcare</span> and the group auto-fills (SP→Sponsored Products, SB→Brands, SD→Display; AMS→Amazon).
         </p>
         <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
           <Btn icon={ocring ? Loader2 : ScanText} onClick={runOcr} variant="teal" disabled={ocring || d.evidence.length === 0}>
@@ -579,7 +779,7 @@ function AuditEditor({ audit, defaultPeriod, vocabulary, onSave, onClose }) {
             <div style={{ fontFamily: T.fontMono, fontSize: 11, color: T.accent, textTransform: 'uppercase', letterSpacing: '0.14em' }}>Claude vision analysis</div>
           </div>
           <p style={{ color: T.textSec, fontSize: 13, lineHeight: 1.55, marginBottom: 14, marginTop: 0 }}>
-            Sends screenshots to Claude for full audit auto-fill. ~$0.02-0.05 per run.
+            Sends screenshots to Claude for full audit auto-fill. Claude reads each brand separately and the app sums brands within each service (recomputing ROAS/ACOS/CPC from the totals) — so multi-brand advertisers like 3M aggregate exactly. ~$0.02-0.08 per run depending on image count.
           </p>
           <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
             <Btn icon={analyzing ? Loader2 : Sparkles} onClick={runAnalysis} variant="accent" disabled={analyzing || d.evidence.length === 0}>
@@ -611,15 +811,29 @@ function AuditEditor({ audit, defaultPeriod, vocabulary, onSave, onClose }) {
       {/* ── Metric rows with autocomplete on Section + Metric ── */}
       <div style={{ borderTop: `1px solid ${T.border}`, paddingTop: 24, marginBottom: 24 }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
-          <div style={{ fontFamily: T.fontDisplay, fontSize: 18, fontWeight: 400 }}>Metric rows <span style={{ color: T.textTer, fontFamily: T.fontMono, fontSize: 11, marginLeft: 8 }}>({d.rows.length})</span></div>
+          <div style={{ fontFamily: T.fontDisplay, fontSize: 18, fontWeight: 400 }}>Metric rows <span style={{ color: T.textTer, fontFamily: T.fontMono, fontSize: 11, marginLeft: 8 }}>({d.rows.length}) · drag ⠿ to reorder</span></div>
           <div style={{ display: 'flex', gap: 6 }}>
             <Btn icon={RefreshCw} onClick={recomputeDeltas} size="sm" disabled={d.rows.length === 0}>Recompute Δ</Btn>
             <Btn icon={Plus} onClick={addRow} size="sm">Add row</Btn>
           </div>
         </div>
         {d.rows.length === 0 && <div style={{ color: T.textTer, fontStyle: 'italic', fontSize: 13, padding: '14px 0' }}>No metrics yet — run OCR or AI above, or add rows manually.</div>}
-        {d.rows.map((r) => (
-          <div key={r.id} style={{ display: 'grid', gridTemplateColumns: '1.2fr 1.2fr 1.2fr 1.2fr 0.8fr 1.2fr auto', gap: 8, marginBottom: 8, alignItems: 'start' }}>
+        {d.rows.map((r, idx) => (
+          <div
+            key={r.id}
+            onDragOver={(e) => { if (dragIdx !== null) e.preventDefault(); }}
+            onDrop={() => { if (dragIdx !== null && dragIdx !== idx) moveRow(dragIdx, idx); setDragIdx(null); }}
+            style={{ display: 'grid', gridTemplateColumns: 'auto 1.2fr 1.2fr 1.2fr 1.2fr 0.8fr 1.2fr auto', gap: 8, marginBottom: 8, alignItems: 'start', opacity: dragIdx === idx ? 0.35 : 1, transition: 'opacity 0.15s' }}
+          >
+            <div
+              draggable
+              onDragStart={() => setDragIdx(idx)}
+              onDragEnd={() => setDragIdx(null)}
+              title="Drag to reorder"
+              style={{ cursor: 'grab', display: 'flex', alignItems: 'center', justifyContent: 'center', color: T.textTer, paddingTop: 10, userSelect: 'none' }}
+            >
+              <GripVertical size={15} strokeWidth={1.5} />
+            </div>
             <AutocompleteInput value={r.section} onChange={(v) => updRow(r.id, 'section', v)} placeholder="Section" mono suggestions={vocabulary.section} />
             <AutocompleteInput value={r.metric} onChange={(v) => updRow(r.id, 'metric', v)} placeholder="Metric" suggestions={vocabulary.metric} />
             <Input value={r.platform} onChange={(v) => updRow(r.id, 'platform', v)} placeholder="Platform" mono />
@@ -645,10 +859,11 @@ function AuditEditor({ audit, defaultPeriod, vocabulary, onSave, onClose }) {
           </label>
         </div>
         {d.evidence.map((ev) => (
-          <div key={ev.id} style={{ display: 'grid', gridTemplateColumns: '80px 110px 1fr auto', gap: 12, marginBottom: 12, padding: 10, background: T.bgInput, border: `1px solid ${T.border}`, borderRadius: 2, alignItems: 'flex-start' }}>
+          <div key={ev.id} style={{ display: 'grid', gridTemplateColumns: '80px 150px 1fr auto', gap: 12, marginBottom: 12, padding: 10, background: T.bgInput, border: `1px solid ${T.border}`, borderRadius: 2, alignItems: 'flex-start' }}>
             <img src={ev.src} alt="" style={{ width: 80, height: 60, objectFit: 'cover', border: `1px solid ${T.border}`, borderRadius: 2 }} />
             <div>
               <Select value={ev.type || ''} onChange={(v) => updEv(ev.id, 'type', v)} options={[{ value: '', label: '— Type —' }, { value: 'tableau', label: 'Tableau' }, { value: 'platform', label: 'Platform' }, { value: 'other', label: 'Other' }]} style={{ width: '100%', fontSize: 11, padding: '7px 8px' }} />
+              <AutocompleteInput value={ev.group || ''} onChange={(v) => updEv(ev.id, 'group', v)} placeholder="Group / service" mono suggestions={vocabulary.section} style={{ marginTop: 6, fontSize: 11, padding: '7px 8px' }} />
               <Input value={ev.label} onChange={(v) => updEv(ev.id, 'label', v)} placeholder="Label" mono style={{ marginTop: 6, fontSize: 11 }} />
             </div>
             <Input multiline value={ev.caption} onChange={(v) => updEv(ev.id, 'caption', v)} placeholder="Caption (optional)…" style={{ minHeight: 60, fontSize: 12 }} />
