@@ -100,20 +100,42 @@ function detectFromText(text, vocabulary) {
 }
 
 function parseNumber(str) {
-  if (!str) return null;
+  if (str === null || str === undefined) return null;
   let s = String(str).trim();
-  let isNeg = false;
-  if (s.startsWith('-') || s.startsWith('−')) { isNeg = true; s = s.slice(1); }
-  s = s.replace(/[$€¥\s]/g, '').replace(/(?:MX\$|US\$|MXN|USD|R\$|MX)/gi, '');
+  if (!s) return null;
+  let isNeg = /^[-−]/.test(s);
+  s = s.replace(/^[-−+]/, '');
+  // strip currency symbols and whitespace (incl. thin-space thousands separators)
+  s = s.replace(/[$€¥]/g, '').replace(/\s/g, '').replace(/(?:MX\$|US\$|MXN|USD|R\$|MX)/gi, '');
   let mult = 1;
   const last = s.charAt(s.length - 1);
   if (/k/i.test(last)) { mult = 1e3; s = s.slice(0, -1); }
   else if (/m/i.test(last)) { mult = 1e6; s = s.slice(0, -1); }
   else if (/b/i.test(last)) { mult = 1e9; s = s.slice(0, -1); }
   else if (last === '%') { s = s.slice(0, -1); }
-  const lc = s.lastIndexOf(','), ld = s.lastIndexOf('.');
-  if (lc > ld) { s = s.replace(/\./g, '').replace(',', '.'); }
-  else { s = s.replace(/,/g, ''); }
+
+  const hasComma = s.includes(',');
+  const hasDot = s.includes('.');
+  if (hasComma && hasDot) {
+    // Both present: the RIGHTMOST separator is the decimal point.
+    if (s.lastIndexOf(',') > s.lastIndexOf('.')) {
+      s = s.replace(/\./g, '').replace(',', '.'); // European: 1.234,56
+    } else {
+      s = s.replace(/,/g, '');                    // US: 1,234.56
+    }
+  } else if (hasComma) {
+    // Only commas. Decimal only if a single comma with 1–2 trailing digits (e.g. "0,69").
+    const parts = s.split(',');
+    if (parts.length === 2 && parts[1].length <= 2) s = s.replace(',', '.');
+    else s = s.replace(/,/g, '');                  // thousands: 1,080,285 → 1080285
+  } else if (hasDot) {
+    // Only dots. Multiple dots = European thousands. A single dot with exactly 3
+    // trailing digits is treated as thousands (1.080 → 1080); otherwise decimal.
+    const parts = s.split('.');
+    if (parts.length > 2) s = s.replace(/\./g, '');
+    else if (parts.length === 2 && parts[1].length === 3) s = s.replace(/\./g, '');
+    // else single dot with 1–2 (or 4+) trailing digits → leave as decimal (8.53, 1.15)
+  }
   const n = parseFloat(s);
   if (isNaN(n)) return null;
   return (isNeg ? -1 : 1) * n * mult;
