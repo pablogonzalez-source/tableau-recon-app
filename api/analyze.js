@@ -1,49 +1,76 @@
 // /api/analyze.js
 // POST /api/analyze with { images: ["data:image/png;base64,..."] }
-// Returns parsed audit data extracted by Claude vision.
+// Returns audit data extracted by Claude vision.
+//
+// IMPORTANT (Option B — "Claude reads, code sums"):
+// Claude does NOT add brands together. For each platform screenshot it reports
+// that brand's RAW metrics. The frontend groups by service and sums them, and
+// recomputes ratios (ROAS/ACOS/CPC/CPM/CTR) from the totals. This keeps the
+// arithmetic exact and consistent instead of relying on the model to add.
 
-const ANALYSIS_PROMPT = `You are analyzing dashboard screenshots to build a reconciliation audit comparing Tableau (internal BI) against advertising platforms (Mercado Libre / Amazon Ads / Amazon DSP consoles).
+const ANALYSIS_PROMPT = `You are analyzing dashboard screenshots to build a reconciliation audit comparing Tableau (internal BI) against advertising platform consoles (Amazon Ads, Amazon DSP, Mercado Libre, etc.).
 
-Across all uploaded images, identify:
-- The advertiser/brand name
-- The advertising surface
-- The date period
-- Which screenshots are Tableau views vs platform/console views
-- The metrics shown on each side (spend, sales, impressions, clicks, CPC, ROAS, etc.)
-- Compute deltas as (tableau − platform) / platform * 100, formatted with sign and %
+KEY CONTEXT: An advertiser often has MULTIPLE BRANDS / sub-accounts, and each brand has MULTIPLE SERVICES:
+- Amazon: "Sponsored Products", "Sponsored Brands", "Display / Video / Audio"
+- Mercado Libre: "Product Ads", "Brand Ads", "Display"
+Tableau usually shows ONE aggregated figure per service (all brands combined). The platform console shows ONE screenshot per brand per service.
 
-Status rules:
-- "clean" if all rows within ±5%
-- "warn" if some rows 5-20% off
-- "issue" if any row > 20% off unexplained
+YOUR JOB IS TO READ, NOT TO SUM. For every platform screenshot, report that single brand's metrics EXACTLY as shown. Do NOT add brands together — the application sums them afterward. Only the Tableau side is the already-aggregated figure for the whole service.
 
-deltaClass per row: "good" if |Δ| ≤ 5%, "meh" if 5-20%, "bad" if > 20%.
+Distinguishing screenshots:
+- TABLEAU views: show filter controls like "Date / Campaign / Line Item / Categories", "Breakdown" panels, week buckets (W14-26), or a "Campaign Type" filter (Sponsored Products / Sponsored Brands / Sponsored Display). Associate each Tableau screenshot to a service via its Campaign Type filter or title.
+- PLATFORM/console views: native consoles — Amazon ("Sponsored ads, Mexico", tabs "All | Sponsored Products | Sponsored Brands | Display, Video, & Audio", "<BRAND> REG" in the header) or Mercado Libre ("Campanhas", "Métricas atribuídas", "Investimento").
 
-CRITICAL: Respond with ONLY a single JSON object. No prose before, no prose after, no markdown code fences. Start your response with { and end with }.
+Identify across all images:
+- account: the advertiser name (e.g. "3M Mexico", "Bachoco", "Biologic")
+- surface: e.g. "Amazon Sponsored Ads · Tableau", "Amazon DSP · Tableau", "Mercado Libre · Tableau"
+- period: the date range shown (e.g. "Apr 1 – Apr 30, 2026")
+- platform: "Amazon" | "MeLi" | other
+- platformLabel: short label for the platform side (e.g. "Amazon Ads", "MeLi platform", "Amazon DSP console")
+- summary: 1-2 sentence narrative of the reconciliation result
+
+Then GROUP BY SERVICE. For each service output an object with:
+- service: the service name (e.g. "Sponsored Products")
+- platformBrands: array with ONE entry per brand's platform screenshot for this service:
+    { "brand": "<brand/account label, e.g. CHSD REG>", "metrics": { ...visible metrics... } }
+- tableau: { ...the Tableau aggregated metrics for this service... }
+
+Metric keys — use EXACTLY these when present: Spend, Sales, Revenue, Impressions, Clicks, Purchases, Units, DPV, ROAS, ACOS, CPC, CPM, CTR.
+Synonym mapping: "Investimento"/"Inversión"→Spend; "Receita"→Revenue; "Vendas"/"Ventas"→Sales; "Impressões"/"Impresiones"→Impressions; "Cliques"/"Clics"→Clicks; "Compras"→Purchases; "Unidades"→Units.
+Report raw numbers as shown (you may keep currency symbols and thousand separators, e.g. "MX$67,950", "1,150,000", "3.91", "25.56%"). Include only metrics actually visible on that screenshot.
+If a service has only ONE brand, still put it as a single-element platformBrands array.
+If a brand shows zero/no data, report "0" or "MX$0.00" — do NOT omit it.
+
+CRITICAL: Respond with ONLY a single JSON object. No prose before or after, no markdown code fences. Start with { and end with }.
 
 {
-  "account": "name",
-  "surface": "Mercado Libre · Tableau" or "Amazon Sponsored Ads · Tableau" or "Amazon DSP · Tableau",
+  "account": "3M Mexico",
+  "surface": "Amazon Sponsored Ads · Tableau",
   "period": "Apr 1 – Apr 30, 2026",
-  "platformLabel": "MeLi platform" or "Amazon Ads" or "Amazon DSP console",
-  "status": "clean" | "warn" | "issue",
-  "statusLabel": "short < 30 chars label",
-  "summary": "1-2 sentence narrative",
-  "rows": [
-    {"section":"...", "metric":"Spend", "platform":"$X", "tableau":"$Y", "delta":"+/-Z%", "deltaClass":"good|meh|bad", "note": "optional"}
+  "platform": "Amazon",
+  "platformLabel": "Amazon Ads",
+  "summary": "Tableau shows spend and sales for Sponsored Products across all brands while platform consoles show zero for the period.",
+  "groups": [
+    {
+      "service": "Sponsored Products",
+      "platformBrands": [
+        { "brand": "CHSD REG",  "metrics": { "Spend": "MX$0.00", "Sales": "MX$0.00", "Impressions": "0", "Clicks": "0" } },
+        { "brand": "SOSD REG",  "metrics": { "Spend": "MX$0.00", "Sales": "MX$0.00", "Impressions": "0", "Clicks": "0" } },
+        { "brand": "HCD REG",   "metrics": { "Spend": "MX$0.00", "Sales": "MX$0.00", "Impressions": "0", "Clicks": "0" } },
+        { "brand": "CHIMD REG", "metrics": { "Spend": "MX$0.00", "Sales": "MX$0.00", "Impressions": "0", "Clicks": "0" } }
+      ],
+      "tableau": { "Spend": "MX$67,950", "Sales": "MX$270,000", "ROAS": "3.91", "ACOS": "25.56%", "Impressions": "1,150,000", "Clicks": "8,000", "CPC": "MX$8.53", "CTR": "0.69%" }
+    }
   ]
 }`;
 
 function extractJson(text) {
   if (!text) return null;
-  // Strip markdown code fences (json or plain) wherever they appear
   let s = String(text)
     .replace(/```json\s*\n?/gi, '')
     .replace(/```\s*\n?/g, '')
     .trim();
-  // Try direct parse
   try { return JSON.parse(s); } catch (_) {}
-  // Find first { and last } — Claude sometimes adds preamble/postamble
   const start = s.indexOf('{');
   const end = s.lastIndexOf('}');
   if (start !== -1 && end > start) {
@@ -73,11 +100,7 @@ export default async function handler(req, res) {
         const m = meta && meta.match(/data:(.+?);base64/);
         return {
           type: 'image',
-          source: {
-            type: 'base64',
-            media_type: m ? m[1] : 'image/png',
-            data: data || '',
-          },
+          source: { type: 'base64', media_type: m ? m[1] : 'image/png', data: data || '' },
         };
       }),
       { type: 'text', text: ANALYSIS_PROMPT },
@@ -91,10 +114,10 @@ export default async function handler(req, res) {
         'anthropic-version': '2023-06-01',
       },
       body: JSON.stringify({
-        // Sonnet has a strong vision/cost balance. For top quality use
-        // 'claude-opus-4-7'; for lowest cost 'claude-haiku-4-5-20251001'.
+        // Sonnet balances vision quality and cost. For hardest multi-brand
+        // reads, switch to 'claude-opus-4-7'. Lowest cost: 'claude-haiku-4-5-20251001'.
         model: 'claude-sonnet-4-6',
-        max_tokens: 3000,
+        max_tokens: 8000,
         messages: [{ role: 'user', content }],
       }),
     });
@@ -114,7 +137,7 @@ export default async function handler(req, res) {
     if (!parsed) {
       return res.status(200).json({
         _parseError: true,
-        rawResponse: text.slice(0, 3000),
+        rawResponse: text.slice(0, 4000),
         stopReason: data.stop_reason || null,
       });
     }
@@ -125,7 +148,6 @@ export default async function handler(req, res) {
   }
 }
 
-// Allow larger payloads — screenshots as base64 can be a few MB.
 export const config = {
   api: { bodyParser: { sizeLimit: '12mb' } },
 };
