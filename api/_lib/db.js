@@ -11,6 +11,7 @@ export const supabase = createClient(
 
 export const auditToClient = (r) => ({
   id: r.id,
+  client: r.client || '',
   account: r.account,
   surface: r.surface,
   period: r.period,
@@ -25,6 +26,7 @@ export const auditToClient = (r) => ({
 
 export const auditToDb = (a) => ({
   id: a.id,
+  client: a.client || '',
   account: a.account,
   surface: a.surface,
   period: a.period || null,
