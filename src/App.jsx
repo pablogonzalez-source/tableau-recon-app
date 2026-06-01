@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo } from 'react';
-import { Plus, Pencil, Trash2, X, Image as ImageIcon, Save, Upload, Eye, Database, Sparkles, Loader2, AlertCircle, ScanText, RefreshCw, GripVertical, Layers } from 'lucide-react';
+import { Plus, Pencil, Trash2, X, Image as ImageIcon, Save, Upload, Eye, Database, Sparkles, Loader2, AlertCircle, ScanText, RefreshCw, GripVertical, Layers, ChevronDown } from 'lucide-react';
 import { api } from './api.js';
 
 // ─── DESIGN TOKENS ───
@@ -492,14 +492,20 @@ function MetricsTable({ rows, platformLabel }) {
   );
 }
 
-function AuditCard({ audit, editMode, onEdit, onDelete, onViewEvidence }) {
+function AuditCard({ audit, editMode, onEdit, onDelete, onViewEvidence, groupedView }) {
   const s = STATUS[audit.status] || STATUS.clean;
   return (
-    <article style={{ background: T.bgCard, border: `1px solid ${T.border}`, borderLeft: `3px solid ${s.color}`, padding: '30px 32px' }}>
+    <article style={{ background: T.bgCard, border: groupedView ? 'none' : `1px solid ${T.border}`, borderLeft: `3px solid ${s.color}`, padding: '30px 32px' }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 16, marginBottom: 18, flexWrap: 'wrap' }}>
         <div style={{ display: 'flex', alignItems: 'baseline', gap: 18, flexWrap: 'wrap' }}>
-          <div style={{ fontFamily: T.fontDisplay, fontSize: 30, fontWeight: 400, letterSpacing: '-0.015em' }}>{audit.account}</div>
-          <div style={{ fontFamily: T.fontMono, fontSize: 10.5, color: T.textTer, textTransform: 'uppercase', letterSpacing: '0.15em', padding: '5px 11px', border: `1px solid ${T.borderLight}`, borderRadius: 2 }}>{audit.surface}</div>
+          {groupedView ? (
+            <div style={{ fontFamily: T.fontDisplay, fontSize: 23, fontWeight: 400, letterSpacing: '-0.01em' }}>{audit.surface}</div>
+          ) : (
+            <>
+              <div style={{ fontFamily: T.fontDisplay, fontSize: 30, fontWeight: 400, letterSpacing: '-0.015em' }}>{audit.account}</div>
+              <div style={{ fontFamily: T.fontMono, fontSize: 10.5, color: T.textTer, textTransform: 'uppercase', letterSpacing: '0.15em', padding: '5px 11px', border: `1px solid ${T.borderLight}`, borderRadius: 2 }}>{audit.surface}</div>
+            </>
+          )}
         </div>
         <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
           <div style={{ fontFamily: T.fontMono, fontSize: 10.5, textTransform: 'uppercase', letterSpacing: '0.14em', padding: '7px 13px', borderRadius: 2, background: s.soft, color: s.color, whiteSpace: 'nowrap' }}>{audit.statusLabel}</div>
@@ -513,6 +519,42 @@ function AuditCard({ audit, editMode, onEdit, onDelete, onViewEvidence }) {
       )}
       <MetricsTable rows={audit.rows || []} platformLabel={audit.platformLabel} />
     </article>
+  );
+}
+
+const STATUS_ORDER = { clean: 1, warn: 2, issue: 3 };
+function groupWorstStatus(items) {
+  return items.reduce((w, a) => (STATUS_ORDER[a.status] || 1) > (STATUS_ORDER[w] || 1) ? a.status : w, 'clean');
+}
+
+// Collapsible client group: one client (account) with its surfaces/platforms inside.
+function AccountGroup({ account, items, expanded, onToggle, editMode, onEdit, onDelete, onViewEvidence }) {
+  const worst = groupWorstStatus(items);
+  const s = STATUS[worst] || STATUS.clean;
+  const counts = { clean: 0, warn: 0, issue: 0 };
+  items.forEach((a) => { counts[a.status] = (counts[a.status] || 0) + 1; });
+  return (
+    <div style={{ border: `1px solid ${T.border}`, borderRadius: 4, overflow: 'hidden', marginBottom: 14 }}>
+      <button onClick={onToggle} style={{ width: '100%', display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 16, padding: '18px 24px', background: T.bgElev, border: 'none', borderLeft: `3px solid ${s.color}`, cursor: 'pointer', textAlign: 'left', fontFamily: T.fontBody }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 14, flexWrap: 'wrap' }}>
+          <ChevronDown size={16} strokeWidth={1.5} style={{ transform: expanded ? 'none' : 'rotate(-90deg)', transition: 'transform 0.2s', color: T.textTer, flexShrink: 0 }} />
+          <span style={{ fontFamily: T.fontDisplay, fontSize: 24, fontWeight: 400, color: T.text, letterSpacing: '-0.015em' }}>{account}</span>
+          <span style={{ fontFamily: T.fontMono, fontSize: 10.5, color: T.textTer, textTransform: 'uppercase', letterSpacing: '0.14em' }}>{items.length} {items.length === 1 ? 'surface' : 'surfaces'}</span>
+        </div>
+        <div style={{ display: 'flex', gap: 12, alignItems: 'center', fontFamily: T.fontMono, fontSize: 12 }}>
+          {counts.clean > 0 && <span style={{ color: T.success }}>✓ {counts.clean}</span>}
+          {counts.warn > 0 && <span style={{ color: T.warning }}>⚠ {counts.warn}</span>}
+          {counts.issue > 0 && <span style={{ color: T.danger }}>✗ {counts.issue}</span>}
+        </div>
+      </button>
+      {expanded && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 1, background: T.border, borderTop: `1px solid ${T.border}` }}>
+          {items.map((a) => (
+            <AuditCard key={a.id} audit={a} groupedView editMode={editMode} onEdit={onEdit} onDelete={onDelete} onViewEvidence={onViewEvidence} />
+          ))}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -1031,6 +1073,32 @@ export default function App() {
     issue: audits.filter((a) => a.status === 'issue').length,
   }), [audits]);
 
+  // Group audits by client (account); each client holds its surfaces/platforms.
+  const groupedAudits = useMemo(() => {
+    const g = {};
+    for (const a of audits) {
+      const key = ((a.account || '').trim()) || 'Sin nombre';
+      (g[key] = g[key] || []).push(a);
+    }
+    return Object.keys(g).sort((x, y) => x.localeCompare(y)).map((k) => ({ account: k, items: g[k] }));
+  }, [audits]);
+
+  // Collapse state. null = auto (clients with problems open, clean ones closed).
+  const [openAccounts, setOpenAccounts] = useState(null);
+  const groupHasProblems = (items) => items.some((a) => a.status === 'warn' || a.status === 'issue');
+  const isAccountOpen = (account, items) => (openAccounts === null ? groupHasProblems(items) : openAccounts.has(account));
+  const toggleAccount = (account) => {
+    setOpenAccounts((prev) => {
+      const base = prev === null
+        ? new Set(groupedAudits.filter((g) => groupHasProblems(g.items)).map((g) => g.account))
+        : new Set(prev);
+      if (base.has(account)) base.delete(account); else base.add(account);
+      return base;
+    });
+  };
+  const expandAllAccounts = () => setOpenAccounts(new Set(groupedAudits.map((g) => g.account)));
+  const collapseAllAccounts = () => setOpenAccounts(new Set());
+
   const handleSavedAudit = async (saved) => {
     setAudits((p) => p.find((x) => x.id === saved.id) ? p.map((x) => (x.id === saved.id ? saved : x)) : [...p, saved]);
     setEditingAudit(null);
@@ -1083,13 +1151,34 @@ export default function App() {
         <Summary stats={stats} />
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 24, flexWrap: 'wrap', marginBottom: 28 }}>
           <h2 style={{ fontFamily: T.fontDisplay, fontWeight: 400, fontSize: 28, letterSpacing: '-0.015em', margin: 0 }}>Account <em style={{ fontStyle: 'italic', color: T.textSec }}>audits</em></h2>
-          <span style={{ fontFamily: T.fontMono, fontSize: 11, color: T.textTer, textTransform: 'uppercase', letterSpacing: '0.15em' }}>
-            {audits.length} audit{audits.length !== 1 ? 's' : ''} · {Object.values(vocabulary).flat().length} terms learned
-          </span>
+          <div style={{ display: 'flex', gap: 16, alignItems: 'center', flexWrap: 'wrap' }}>
+            {groupedAudits.length > 1 && (
+              <div style={{ display: 'flex', gap: 10 }}>
+                <button onClick={expandAllAccounts} style={{ background: 'none', border: 'none', color: T.textTer, fontFamily: T.fontMono, fontSize: 10.5, textTransform: 'uppercase', letterSpacing: '0.12em', cursor: 'pointer', padding: 0 }}>Expand all</button>
+                <span style={{ color: T.border }}>·</span>
+                <button onClick={collapseAllAccounts} style={{ background: 'none', border: 'none', color: T.textTer, fontFamily: T.fontMono, fontSize: 10.5, textTransform: 'uppercase', letterSpacing: '0.12em', cursor: 'pointer', padding: 0 }}>Collapse all</button>
+              </div>
+            )}
+            <span style={{ fontFamily: T.fontMono, fontSize: 11, color: T.textTer, textTransform: 'uppercase', letterSpacing: '0.15em' }}>
+              {groupedAudits.length} client{groupedAudits.length !== 1 ? 's' : ''} · {audits.length} audit{audits.length !== 1 ? 's' : ''}
+            </span>
+          </div>
         </div>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 18, marginBottom: 72 }}>
+        <div style={{ marginBottom: 72 }}>
           {audits.length === 0 && <div style={{ background: T.bgCard, border: `1px dashed ${T.borderLight}`, padding: 56, textAlign: 'center', color: T.textTer, fontSize: 13 }}>No audits yet. Click <strong style={{ color: T.text }}>Add audit</strong> to start.</div>}
-          {audits.map((a) => <AuditCard key={a.id} audit={a} editMode={editMode} onEdit={(a) => setEditingAudit(a.id)} onDelete={delAudit} onViewEvidence={setViewingEvidence} />)}
+          {groupedAudits.map((g) => (
+            <AccountGroup
+              key={g.account}
+              account={g.account}
+              items={g.items}
+              expanded={isAccountOpen(g.account, g.items)}
+              onToggle={() => toggleAccount(g.account)}
+              editMode={editMode}
+              onEdit={(a) => setEditingAudit(a.id)}
+              onDelete={delAudit}
+              onViewEvidence={setViewingEvidence}
+            />
+          ))}
         </div>
         <Investigations list={investigations} editMode={editMode} onAdd={() => setEditingInv('new')} onEdit={(i) => setEditingInv(i.id)} onDelete={delInv} />
         <footer style={{ paddingTop: 32, borderTop: `1px solid ${T.border}`, color: T.textTer, fontSize: 11.5, fontFamily: T.fontMono, textAlign: 'center', letterSpacing: '0.08em' }}>
