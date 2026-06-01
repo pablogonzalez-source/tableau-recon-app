@@ -28,7 +28,7 @@ const EMPTY_VOCAB = { account: [], surface: [], platform_label: [], status_label
 // ─── HELPERS ───
 const uid = () => 'id_' + Math.random().toString(36).slice(2, 10);
 const blank = {
-  audit: (period) => ({ id: uid(), account: '', surface: '', period: period || '', status: 'clean', statusLabel: '', summary: '', platformLabel: 'Platform', rows: [], evidence: [] }),
+  audit: (period) => ({ id: uid(), client: '', account: '', surface: '', period: period || '', status: 'clean', statusLabel: '', summary: '', platformLabel: 'Platform', rows: [], evidence: [] }),
   row:   () => ({ id: uid(), section: '', metric: '', platform: '', tableau: '', delta: '', deltaClass: 'good', note: '' }),
   inv:   () => ({ id: uid(), account: '', title: '', detail: '', severity: 'med' }),
 };
@@ -492,14 +492,27 @@ function MetricsTable({ rows, platformLabel }) {
   );
 }
 
-function AuditCard({ audit, editMode, onEdit, onDelete, onViewEvidence, groupedView }) {
+function AuditCard({ audit, editMode, onEdit, onDelete, onViewEvidence, groupedView, groupKey }) {
   const s = STATUS[audit.status] || STATUS.clean;
+  // In grouped view, show only the distinctive part: the account with the client
+  // prefix stripped (e.g. "Vendor Inventory"), or the surface when nothing remains.
+  const acc = (audit.account || '').trim();
+  let distinctTitle = audit.surface || acc;
+  if (groupKey && acc.toLowerCase().startsWith(groupKey.toLowerCase())) {
+    const rest = acc.slice(groupKey.length).replace(/^[\s\-–—:·|]+/, '').trim();
+    distinctTitle = rest || audit.surface || acc;
+  }
   return (
     <article style={{ background: T.bgCard, border: groupedView ? 'none' : `1px solid ${T.border}`, borderLeft: `3px solid ${s.color}`, padding: '30px 32px' }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 16, marginBottom: 18, flexWrap: 'wrap' }}>
         <div style={{ display: 'flex', alignItems: 'baseline', gap: 18, flexWrap: 'wrap' }}>
           {groupedView ? (
-            <div style={{ fontFamily: T.fontDisplay, fontSize: 23, fontWeight: 400, letterSpacing: '-0.01em' }}>{audit.surface}</div>
+            <>
+              <div style={{ fontFamily: T.fontDisplay, fontSize: 23, fontWeight: 400, letterSpacing: '-0.01em' }}>{distinctTitle}</div>
+              {audit.surface && audit.surface !== distinctTitle && (
+                <div style={{ fontFamily: T.fontMono, fontSize: 10.5, color: T.textTer, textTransform: 'uppercase', letterSpacing: '0.15em', padding: '5px 11px', border: `1px solid ${T.borderLight}`, borderRadius: 2 }}>{audit.surface}</div>
+              )}
+            </>
           ) : (
             <>
               <div style={{ fontFamily: T.fontDisplay, fontSize: 30, fontWeight: 400, letterSpacing: '-0.015em' }}>{audit.account}</div>
@@ -550,7 +563,7 @@ function AccountGroup({ account, items, expanded, onToggle, editMode, onEdit, on
       {expanded && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 1, background: T.border, borderTop: `1px solid ${T.border}` }}>
           {items.map((a) => (
-            <AuditCard key={a.id} audit={a} groupedView editMode={editMode} onEdit={onEdit} onDelete={onDelete} onViewEvidence={onViewEvidence} />
+            <AuditCard key={a.id} audit={a} groupedView groupKey={account} editMode={editMode} onEdit={onEdit} onDelete={onDelete} onViewEvidence={onViewEvidence} />
           ))}
         </div>
       )}
@@ -573,7 +586,7 @@ function EvidenceModal({ audit, onClose }) {
   );
 }
 
-function AuditEditor({ audit, defaultPeriod, vocabulary, onSave, onClose }) {
+function AuditEditor({ audit, defaultPeriod, vocabulary, clientSuggestions = [], onSave, onClose }) {
   const [d, setD] = useState(audit || blank.audit(defaultPeriod));
   // Claude AI state
   const [analyzing, setAnalyzing] = useState(false);
@@ -862,6 +875,13 @@ function AuditEditor({ audit, defaultPeriod, vocabulary, onSave, onClose }) {
       </details>
 
       {/* ── Header fields with autocomplete ── */}
+      <div style={{ marginBottom: 18 }}>
+        <Label>Cliente / grupo</Label>
+        <AutocompleteInput value={d.client} onChange={(v) => upd('client', v)} placeholder="Interamerican Foods Corporation" suggestions={clientSuggestions} />
+        <div style={{ fontFamily: T.fontMono, fontSize: 10.5, color: T.textTer, marginTop: 6, lineHeight: 1.5 }}>
+          Agrupa este audit bajo un cliente en la portada. Usa el mismo nombre exacto para juntar varias plataformas. Déjalo vacío y será su propio grupo.
+        </div>
+      </div>
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 18, marginBottom: 18 }}>
         <div><Label>Account</Label><AutocompleteInput value={d.account} onChange={(v) => upd('account', v)} placeholder="Bachoco" suggestions={vocabulary.account} /></div>
         <div><Label>Surface</Label><AutocompleteInput value={d.surface} onChange={(v) => upd('surface', v)} placeholder="Mercado Libre · Tableau" suggestions={vocabulary.surface} /></div>
@@ -1073,14 +1093,25 @@ export default function App() {
     issue: audits.filter((a) => a.status === 'issue').length,
   }), [audits]);
 
-  // Group audits by client (account); each client holds its surfaces/platforms.
+  // Group audits by client. Uses the explicit `client` field; falls back to
+  // `account` when a client hasn't been assigned, so old audits still appear.
   const groupedAudits = useMemo(() => {
     const g = {};
     for (const a of audits) {
-      const key = ((a.account || '').trim()) || 'Sin nombre';
+      const key = (((a.client || '').trim()) || ((a.account || '').trim())) || 'Sin nombre';
       (g[key] = g[key] || []).push(a);
     }
     return Object.keys(g).sort((x, y) => x.localeCompare(y)).map((k) => ({ account: k, items: g[k] }));
+  }, [audits]);
+
+  // Existing client/account names, for the autocomplete in the editor.
+  const clientSuggestions = useMemo(() => {
+    const set = new Set();
+    for (const a of audits) {
+      const c = ((a.client || '').trim()) || ((a.account || '').trim());
+      if (c) set.add(c);
+    }
+    return [...set].sort((x, y) => x.localeCompare(y));
   }, [audits]);
 
   // Collapse state. null = auto (clients with problems open, clean ones closed).
@@ -1185,7 +1216,7 @@ export default function App() {
           Reconciliation app · multi-user · OCR with learning vocabulary
         </footer>
       </div>
-      {editingAudit && <AuditEditor audit={editingAudit === 'new' ? null : audits.find((a) => a.id === editingAudit)} defaultPeriod={meta.period} vocabulary={vocabulary} onSave={handleSavedAudit} onClose={() => setEditingAudit(null)} />}
+      {editingAudit && <AuditEditor audit={editingAudit === 'new' ? null : audits.find((a) => a.id === editingAudit)} defaultPeriod={meta.period} vocabulary={vocabulary} clientSuggestions={clientSuggestions} onSave={handleSavedAudit} onClose={() => setEditingAudit(null)} />}
       {viewingEvidence && <EvidenceModal audit={viewingEvidence} onClose={() => setViewingEvidence(null)} />}
       {editingInv && <InvestigationEditor investigation={editingInv === 'new' ? null : investigations.find((i) => i.id === editingInv)} onSave={handleSavedInv} onClose={() => setEditingInv(null)} />}
       {editingMeta && <MetaEditor meta={meta} onSave={handleSavedMeta} onClose={() => setEditingMeta(false)} />}
